@@ -45,6 +45,7 @@ type HTTPHandler struct {
 	StaticDir     string
 	Version       string
 	LocalCLIToken string
+	UITitle       string
 }
 
 type protectedResponseWriter struct {
@@ -1505,11 +1506,13 @@ func (h *HTTPHandler) handleFrontend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	content := indexHTML
 	if h.shouldRewriteRelayedAssets(r) {
-		w.Write([]byte(rewriteRelayedFrontendContent(indexHTML)))
-		return
+		content = rewriteRelayedFrontendContent(content)
+	} else {
+		content = renderFallbackFrontend(content, frontendAssetMissingNotice(r.URL.Path))
 	}
-	w.Write([]byte(renderFallbackFrontend(indexHTML, frontendAssetMissingNotice(r.URL.Path))))
+	w.Write(h.applyUITitle([]byte(content)))
 }
 
 func (h *HTTPHandler) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -1571,20 +1574,34 @@ func (h *HTTPHandler) serveFrontendIndex(w http.ResponseWriter, r *http.Request,
 	content, err := os.ReadFile(indexPath)
 	if err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(renderFallbackFrontend(indexHTML, frontendAssetMissingNotice(r.URL.Path))))
+		w.Write(h.applyUITitle([]byte(renderFallbackFrontend(indexHTML, frontendAssetMissingNotice(r.URL.Path)))))
 		return
 	}
 	if missing := missingFrontendIndexResource(staticDir, content); missing != "" {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(renderFallbackFrontend(indexHTML, frontendAssetMissingNotice(missing))))
+		w.Write(h.applyUITitle([]byte(renderFallbackFrontend(indexHTML, frontendAssetMissingNotice(missing)))))
 		return
 	}
+	content = h.applyUITitle(content)
 	if h.shouldRewriteRelayedAssets(r) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(rewriteRelayedFrontendContent(string(content))))
 		return
 	}
-	http.ServeFile(w, r, indexPath)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(content)
+}
+
+// applyUITitle swaps the page <title> for the -title flag (e.g. MindFS-TX) so
+// multiple instances can be told apart in the browser tab. Empty or the
+// default value leaves the served HTML untouched.
+func (h *HTTPHandler) applyUITitle(content []byte) []byte {
+	title := strings.TrimSpace(h.UITitle)
+	if title == "" || title == "MindFS" {
+		return content
+	}
+	replacement := []byte("<title>" + htmpl.HTMLEscapeString(title) + "</title>")
+	return bytes.Replace(content, []byte("<title>MindFS</title>"), replacement, 1)
 }
 
 func missingFrontendIndexResource(staticDir string, indexContent []byte) string {
