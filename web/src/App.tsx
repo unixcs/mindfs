@@ -659,6 +659,8 @@ function relatedFileSelectionKey(file: RelatedFileClickTarget | null | undefined
 type URLState = {
   root: string;
   file: string;
+  /** 目录视图深链（相对 root 的路径）；undefined/"."/"" = 不在目录视图，replaceState 时自动从 URL 消失 */
+  dir?: string;
   session: string;
   cursor: number;
   pluginQuery: Record<string, string>;
@@ -1002,6 +1004,7 @@ function readURLState(): URLState {
   return {
     root: params.get("root") || "",
     file: params.get("file") || "",
+    dir: params.get("dir") || "",
     session: params.get("session") || "",
     cursor: parseCursor(params.get("cursor")),
     pluginQuery: parsePluginQuery(window.location.search),
@@ -1012,6 +1015,7 @@ function buildURLSearch(next: URLState): string {
   const params = new URLSearchParams();
   if (next.root) params.set("root", next.root);
   if (next.file) params.set("file", next.file);
+  if (next.dir && next.dir !== ".") params.set("dir", next.dir);
   if (next.session) params.set("session", next.session);
   if (next.cursor > 0) params.set("cursor", String(next.cursor));
   Object.entries(next.pluginQuery).forEach(([key, value]) => {
@@ -7313,6 +7317,7 @@ export function App({ onGoHome }: AppProps) {
           replaceURLState({
             root,
             file: "",
+            dir: targetIsRoot ? "" : targetPath,
             session: "",
             cursor: 0,
             pluginQuery: nextPluginQuery,
@@ -10628,6 +10633,18 @@ export function App({ onGoHome }: AppProps) {
             preservePluginQuery: true,
           });
         } else {
+          if (urlState.dir && urlState.dir !== ".") {
+            // 深链 ?root=<id>&dir=<相对路径>：直接落到 root 下的子目录（外部入口如 AIOS 项目卡）
+            await ensurePluginsLoaded(preferredRoot);
+            if (cancelled) return;
+            actionHandlersRef.current.open_dir({
+              path: urlState.dir,
+              root: preferredRoot,
+              forceDirectory: true,
+              preservePluginQuery: true,
+            });
+            return;
+          }
           const restored = await tryShowBoundSessionForRoot(preferredRoot, {
             pluginQuery: urlState.pluginQuery,
           });
@@ -10820,6 +10837,15 @@ export function App({ onGoHome }: AppProps) {
             preservePluginQuery: true,
           });
         }
+        return;
+      }
+      if (state.dir && state.dir !== ".") {
+        actionHandlers.open_dir({
+          path: state.dir,
+          root: state.root,
+          forceDirectory: true,
+          preservePluginQuery: true,
+        });
         return;
       }
       void (async () => {
