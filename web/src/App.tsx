@@ -60,6 +60,11 @@ import {
   type SendShortcut,
 } from "./services/sendShortcut";
 import {
+  loadFloatBallGestureConfig,
+  persistFloatBallGestureConfig,
+  type FloatBallGestureConfig,
+} from "./services/quickSwitch";
+import {
   loadFontSizePreferences,
   persistFontSizePreferences,
   type FontSizePreferences,
@@ -1712,6 +1717,7 @@ export function App({ onGoHome }: AppProps) {
   const { isMobile, isTablet } = useResponsive();
   const [mobileEnterKeySends, setMobileEnterKeySends] = useState(loadMobileEnterKeySends);
   const [sendShortcut, setSendShortcut] = useState<SendShortcut | null>(loadSendShortcut);
+  const [floatBallGestures, setFloatBallGestures] = useState<FloatBallGestureConfig>(loadFloatBallGestureConfig);
   const [sidebarsSwapped, setSidebarsSwapped] = useState(loadSidebarsSwapped);
   const [fontSizePreferences, setFontSizePreferences] = useState<FontSizePreferences>(loadFontSizePreferences);
   const [gitDiffSideBySide, setGitDiffSideBySide] = useState(loadGitDiffSideBySide);
@@ -2372,6 +2378,10 @@ export function App({ onGoHome }: AppProps) {
   useEffect(() => {
     persistSendShortcut(sendShortcut);
   }, [sendShortcut]);
+
+  useEffect(() => {
+    persistFloatBallGestureConfig(floatBallGestures);
+  }, [floatBallGestures]);
 
   useEffect(() => {
     persistFontSizePreferences(fontSizePreferences);
@@ -14503,6 +14513,8 @@ export function App({ onGoHome }: AppProps) {
             onSendShortcutChange={setSendShortcut}
             sidebarsSwapped={sidebarsSwapped}
             onSidebarsSwappedChange={setSidebarsSwapped}
+            floatBallGestures={floatBallGestures}
+            onFloatBallGesturesChange={setFloatBallGestures}
             gitDiffSideBySide={gitDiffSideBySide}
             onGitDiffSideBySideChange={setGitDiffSideBySide}
             multiProjectSessionsEnabled={multiProjectSessionsEnabled}
@@ -14628,6 +14640,7 @@ export function App({ onGoHome }: AppProps) {
               onToggleLeftSidebar={() => setIsLeftOpen((v) => !v)}
               onToggleRightSidebar={() => setIsRightOpen((v) => !v)}
               sidebarsSwapped={sidebarsSwapped}
+              floatBallGestures={floatBallGestures}
             />
           </div>
         }
