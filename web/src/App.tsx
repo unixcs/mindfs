@@ -161,6 +161,12 @@ import { GitStatusPanel } from "./components/GitStatusPanel";
 import { SessionViewer } from "./components/SessionViewer";
 import { DefaultListView, type MainContentViewMode } from "./components/DefaultListView";
 import { MultiProjectSessionList, SessionList, type ProjectSessionGroup } from "./components/SessionList";
+import {
+  loadSessionFilter,
+  persistSessionFilter,
+  type SessionFilterState,
+} from "./services/sessionFilter";
+import { HandoffPackDialog } from "./components/HandoffPackDialog";
 import { ExternalSessionList } from "./components/ExternalSessionList";
 import { InlineTokenText } from "./components/InlineTokenText";
 import { AgentIcon } from "./components/AgentIcon";
@@ -2513,6 +2519,15 @@ export function App({ onGoHome }: AppProps) {
     id: number;
     content: string;
   } | null>(null);
+  const [sessionFilter, setSessionFilter] = useState<SessionFilterState>(() => loadSessionFilter());
+  const handleSessionFilterChange = useCallback((next: SessionFilterState) => {
+    setSessionFilter(next);
+    persistSessionFilter(next);
+  }, []);
+  const [handoffPackSession, setHandoffPackSession] = useState<SessionItem | null>(null);
+  const handleHandoffPack = useCallback((session: SessionItem) => {
+    setHandoffPackSession(session);
+  }, []);
   const [entriesByPath, setEntriesByPath] = useState<
     Record<string, FileEntry[]>
   >({});
@@ -14199,6 +14214,9 @@ export function App({ onGoHome }: AppProps) {
         }}
         onLoadMoreProject={loadMoreMultiProjectSessions}
         onLoadChildren={loadChildSessionsForParent}
+        onHandoffPack={handleHandoffPack}
+        filter={sessionFilter}
+        onFilterChange={handleSessionFilterChange}
       />
     ) : (
       <SessionList
@@ -14295,6 +14313,9 @@ export function App({ onGoHome }: AppProps) {
             ? false
             : hasMoreSessions
         }
+        onHandoffPack={handleHandoffPack}
+        filter={sessionFilter}
+        onFilterChange={handleSessionFilterChange}
       />
     );
   const tokenStationBalanceText = tokenStationLoading
@@ -14762,6 +14783,11 @@ export function App({ onGoHome }: AppProps) {
             )}
           </BottomSheet>
         }
+      />
+      <HandoffPackDialog
+        session={handoffPackSession}
+        onClose={() => setHandoffPackSession(null)}
+        onInsert={(pack) => handleEditUserMessage(pack)}
       />
       {!isMobile ? <OnboardingTour
         open={onboardingOpen}
