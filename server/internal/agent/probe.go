@@ -59,7 +59,12 @@ type Status struct {
 const (
 	probeSessionTimeout     = 45 * time.Second
 	probeInteractionTimeout = 3 * time.Minute
-	probeModelListTimeout   = 30 * time.Second
+	// Device agents pay an SSH round trip (mux semaphore queueing + remote
+	// CLI cold start) before the CLI is even up; 4x keeps the same safety
+	// margin over the wire.
+	probeDeviceSessionTimeout     = 3 * time.Minute
+	probeDeviceInteractionTimeout = 6 * time.Minute
+	probeModelListTimeout         = 30 * time.Second
 	probeCommandListTimeout = 30 * time.Second
 	probeRotateAfterCount   = 100
 	probeRotateAfterAge     = 24 * time.Hour
@@ -675,7 +680,7 @@ func probeInstalledAgentWithPool(ctx context.Context, name string, def Definitio
 	defer pool.Close(sessionKey)
 	openCtx := ctx
 	sessionCancel := func() {}
-	if timeout, ok := probeSessionTimeoutForPhase(phase); ok {
+	if timeout, ok := probeSessionTimeoutForPhase(phase, strings.TrimSpace(def.Device) != ""); ok {
 		openCtx, sessionCancel = context.WithTimeout(ctx, timeout)
 	}
 	defer sessionCancel()
@@ -995,10 +1000,18 @@ func resolveProbePool(def Definition, shared *Pool) (*Pool, bool) {
 	return NewPool(Config{Agents: []Definition{def}}), true
 }
 
-func probeSessionTimeoutForPhase(phase probePhase) (time.Duration, bool) {
+// probeSessionTimeoutForPhase caps the runtime-session open during a probe.
+// Device agents tunnel the CLI spawn over SSH (per-host mux semaphore plus a
+// remote cold start), which routinely exceeds the local budget, so they get
+// the device multiplier.
+func probeSessionTimeoutForPhase(phase probePhase, device bool) (time.Duration, bool) {
 	switch phase {
 	case probePhaseInitial:
-		return probeSessionTimeout, true
+		timeout := probeSessionTimeout
+		if device {
+			timeout = probeDeviceSessionTimeout
+		}
+		return timeout, true
 	case probePhaseRecovery:
 		return 30 * time.Second, true
 	default:
@@ -1006,10 +1019,14 @@ func probeSessionTimeoutForPhase(phase probePhase) (time.Duration, bool) {
 	}
 }
 
-func probeInteractionTimeoutForPhase(phase probePhase) (time.Duration, bool) {
+func probeInteractionTimeoutForPhase(phase probePhase, device bool) (time.Duration, bool) {
 	switch phase {
 	case probePhaseInitial:
-		return probeInteractionTimeout, true
+		timeout := probeInteractionTimeout
+		if device {
+			timeout = probeDeviceInteractionTimeout
+		}
+		return timeout, true
 	case probePhaseRecovery:
 		return 30 * time.Second, true
 	default:
