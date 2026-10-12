@@ -127,7 +127,10 @@ func (h *HTTPHandler) handleDeviceDelete(w http.ResponseWriter, r *http.Request)
 	// from the live pool config.
 	removedAgents := 0
 	if cfgPath, err := agent.ResolveConfigPath(); err == nil {
-		if removed, err := remote.RemoveDeviceAgents(cfgPath, id); err != nil {
+		agentConfigMu.Lock()
+		removed, err := remote.RemoveDeviceAgents(cfgPath, id)
+		agentConfigMu.Unlock()
+		if err != nil {
 			log.Printf("[devices] delete %s: remove agents.json entries: %v", id, err)
 		} else {
 			removedAgents = len(removed)
@@ -277,7 +280,9 @@ func (h *HTTPHandler) provisionDeviceAgents(ctx context.Context, device remote.D
 			CwdTemplate: entry.CwdTemplate,
 		})
 	}
+	agentConfigMu.Lock()
 	created, _, err := remote.UpsertDeviceAgents(cfgPath, entries)
+	agentConfigMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
