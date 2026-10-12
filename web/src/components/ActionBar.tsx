@@ -97,6 +97,8 @@ type ActionBarProps = {
   taskGroupBadge?: React.ReactNode;
   status?: WSStatus;
   agentsVersion?: number;
+  /** 启用的远程设备（AgentSelector 设备列）；空数组/缺省 = 只显示本机列。 */
+  devices?: Array<{ id: string; label: string }>;
   codexRateLimitsRefreshToken?: number;
   currentRootId?: string | null;
   currentRootIsGitRepo?: boolean;
@@ -415,6 +417,7 @@ export function ActionBar({
   taskGroupBadge,
   status = "disconnected",
   agentsVersion = 0,
+  devices,
   codexRateLimitsRefreshToken = 0,
   currentRootId,
   currentRootIsGitRepo = false,
@@ -1891,6 +1894,7 @@ export function ActionBar({
                     mode={agentMode}
                     effort={effort}
                     agents={entryAgents}
+                    devices={devices}
                     onAgentChange={(nextAgent, nextModel) => {
                       const nextStatus = agents.find((item) => item.name === nextAgent);
                       const defaults = getAgentDefaults(nextStatus);

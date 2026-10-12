@@ -6,6 +6,8 @@ export type FileEntry = {
   is_root?: boolean;
   size?: number;
   mtime?: string;
+  /** Owning remote device id for device roots; empty/undefined for local roots. */
+  device?: string;
 };
 
 export type DirectorySortMode =

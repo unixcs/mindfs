@@ -2176,6 +2176,10 @@ type uploadTestRegistry struct {
 	root rootfs.RootInfo
 }
 
+func (uploadTestRegistry) GetDeviceRuntime() (DeviceRuntime, bool) {
+	return DeviceRuntime{}, false
+}
+
 func (r uploadTestRegistry) GetRoot(rootID string) (rootfs.RootInfo, error) {
 	if rootID != r.root.ID {
 		return rootfs.RootInfo{}, errors.New("root not found")
@@ -2370,6 +2374,10 @@ func (r *commandTestRegistry) GetFileWatcher(string, *session.Manager) (*rootfs.
 	return nil, nil
 }
 
+func (r commandTestRegistry) GetDeviceRuntime() (DeviceRuntime, bool) {
+	return DeviceRuntime{}, false
+}
+
 func (r *commandTestRegistry) ReleaseFileWatcher(string, string) {}
 
 type multiRootSearchTestRegistry struct {
@@ -2434,6 +2442,10 @@ func (r *multiRootSearchTestRegistry) GetFileWatcher(string, *session.Manager) (
 	return nil, nil
 }
 
+func (r multiRootSearchTestRegistry) GetDeviceRuntime() (DeviceRuntime, bool) {
+	return DeviceRuntime{}, false
+}
+
 func (r *multiRootSearchTestRegistry) ReleaseFileWatcher(string, string) {}
 
 type renameManagedDirTestRegistry struct {
@@ -2477,6 +2489,10 @@ func (r *renameManagedDirTestRegistry) RenameRoot(rootID, name, rootPath string)
 
 func (r *renameManagedDirTestRegistry) ReleaseRootResources(string) {
 	r.releaseRootResourcesCalled = true
+}
+
+func (r *renameManagedDirTestRegistry) GetDeviceRuntime() (DeviceRuntime, bool) {
+	return DeviceRuntime{}, false
 }
 
 func (r *renameManagedDirTestRegistry) ListRoots() []rootfs.RootInfo {

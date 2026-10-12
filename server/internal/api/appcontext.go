@@ -12,10 +12,12 @@ import (
 	"sync"
 	"time"
 
+	"mindfs/internal/remote"
 	"mindfs/server/internal/agent"
 	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/api/usecase"
 	"mindfs/server/internal/commandexec"
+	configpkg "mindfs/server/internal/config"
 	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/githubimport"
@@ -41,6 +43,7 @@ type AppContext struct {
 	Dirs      *fs.Registry
 	Agents    *agent.Pool
 	Prober    *agent.Prober
+	Devices   *remote.Store
 	Relay     *relay.Manager
 	RelayTips *relay.TipsService
 	Update    *update.Service
@@ -513,6 +516,18 @@ func (s *AppContext) GetAgentPool() *agent.Pool {
 	return s.Agents
 }
 
+// GetDeviceRuntime exposes remote device support to usecase services.
+func (s *AppContext) GetDeviceRuntime() (usecase.DeviceRuntime, bool) {
+	if s == nil || s.Devices == nil {
+		return usecase.DeviceRuntime{}, false
+	}
+	configDir, err := configpkg.MindFSConfigDir()
+	if err != nil {
+		return usecase.DeviceRuntime{}, false
+	}
+	return usecase.DeviceRuntime{Store: s.Devices, ConfigDir: configDir}, true
+}
+
 func (s *AppContext) GetPreferences() *preferences.Store {
 	return s.Prefs
 }
@@ -678,6 +693,11 @@ func (s *AppContext) ListRoots() []fs.RootInfo {
 }
 
 func managedRootExists(root fs.RootInfo) (bool, error) {
+	// 设备根的 RootPath 在远端，本地 os.Stat 必然失败；视为存在，避免
+	// ListRoots/GetRootContext 误删设备根。
+	if strings.TrimSpace(root.Device) != "" {
+		return true, nil
+	}
 	path := strings.TrimSpace(root.RootPath)
 	if path == "" {
 		return false, nil

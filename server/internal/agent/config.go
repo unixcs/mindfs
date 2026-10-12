@@ -78,6 +78,10 @@ type Definition struct {
 	// Empty = infer from the built-in table by agent name.
 	APIProviderProtocols []string `json:"apiProviderProtocols,omitempty"`
 
+	// Device is the remote device ID this agent runs on via SSH.
+	// Empty = run locally.
+	Device string `json:"device,omitempty"`
+
 	// Command is the executable name or path.
 	Command string `json:"command"`
 
@@ -350,6 +354,9 @@ func mergeAgentDefinition(base Definition, override Definition) Definition {
 	}
 	if len(merged.APIProviderProtocols) == 0 {
 		merged.APIProviderProtocols = append([]string(nil), base.APIProviderProtocols...)
+	}
+	if merged.Device == "" {
+		merged.Device = base.Device
 	}
 	if len(merged.InstallCommands) == 0 {
 		merged.InstallCommands = append(LifecycleCommands(nil), base.InstallCommands...)

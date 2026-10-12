@@ -27,7 +27,7 @@ func (s *Service) OperateFile(in FileOperationInput) error {
 	if err := s.ensureRegistry(); err != nil {
 		return err
 	}
-	root, err := s.Registry.GetRoot(in.Root)
+	root, err := s.ensureWritableLocalRoot(in.Root)
 	if err != nil {
 		return err
 	}
@@ -116,7 +116,10 @@ func (s *Service) ReadEditableFile(ctx context.Context, rootID, path string) (fs
 	if err := s.ensureRegistry(); err != nil {
 		return fs.ReadResult{}, err
 	}
-	root, err := s.Registry.GetRoot(rootID)
+	// Device roots resolve their file contents over SSH (tree/read APIs); the
+	// editor path would stat RootPath on THIS machine and happily serve a
+	// same-named local file, so device roots are refused here.
+	root, err := s.ensureWritableLocalRoot(rootID)
 	if err != nil {
 		return fs.ReadResult{}, err
 	}
@@ -137,7 +140,7 @@ func (s *Service) WriteEditableFile(rootID, path, content, revision string) (fs.
 	if err := s.ensureRegistry(); err != nil {
 		return fs.ReadResult{}, err
 	}
-	root, err := s.Registry.GetRoot(rootID)
+	root, err := s.ensureWritableLocalRoot(rootID)
 	if err != nil {
 		return fs.ReadResult{}, err
 	}
@@ -152,7 +155,7 @@ func (s *Service) CreateBlankFile(rootID, dir, name string) (string, error) {
 	if err := s.ensureRegistry(); err != nil {
 		return "", err
 	}
-	root, err := s.Registry.GetRoot(rootID)
+	root, err := s.ensureWritableLocalRoot(rootID)
 	if err != nil {
 		return "", err
 	}

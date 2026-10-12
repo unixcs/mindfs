@@ -91,6 +91,11 @@ func (s *Service) SearchCandidates(ctx context.Context, in SearchCandidatesInput
 		if err != nil {
 			return SearchCandidatesOutput{}, err
 		}
+		// Candidate search scans RootPath locally; refuse device roots so a
+		// same-named local directory is never presented as device content.
+		if err := rejectDeviceRoot(root); err != nil {
+			return SearchCandidatesOutput{}, err
+		}
 	}
 	registry := s.Registry.GetCandidateRegistry()
 	if in.Type == CandidateTypeSkill {

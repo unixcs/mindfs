@@ -16,9 +16,9 @@ import { FileEditStore, fileEditKey, MAX_EDITABLE_FILE_BYTES } from "../services
 import { FileEditor } from "./FileEditor";
 import { FileOperationItems, FileMenuIcon, fileMenuItemStyle, MoreMenuButton, moreMenuPopoverStyle, menuOverlayStyle, MoveFilePopover } from "./FileOperations";
 
-function FileViewerMenu({ root, rootPath, path, downloading, onDownload, onEdit, onComplete }: {
-  root: string; rootPath?: string; path: string; downloading: boolean; onDownload: () => void;
-  onEdit?: () => void; onComplete?: () => void | Promise<void>;
+function FileViewerMenu({ root, rootPath, path, downloading, onDownload, onEdit, onComplete, rootIsDevice }: {
+  root: string; rootPath?: string; path: string; downloading: boolean; onDownload?: () => void;
+  onEdit?: () => void; onComplete?: () => void | Promise<void>; rootIsDevice?: boolean;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -33,9 +33,9 @@ function FileViewerMenu({ root, rootPath, path, downloading, onDownload, onEdit,
   return <div ref={ref} style={{ position: "relative" }} onKeyDown={event => { if (event.key === "Escape") { setOpen(false); setMoveOpen(false); } }}>
     <MoreMenuButton open={open} label={t("fileOperation.menu")} onClick={() => { setMoveOpen(false); setOpen(value => !value); }} />
     {open && <div role="menu" style={moreMenuPopoverStyle}>
-      <button type="button" role="menuitem" style={fileMenuItemStyle} disabled={!root || downloading} onClick={() => { setOpen(false); onDownload(); }}><FileMenuIcon action="download" /><span>{t("fileOperation.download")}</span></button>
+      {onDownload && <button type="button" role="menuitem" style={fileMenuItemStyle} disabled={!root || downloading} onClick={() => { setOpen(false); onDownload(); }}><FileMenuIcon action="download" /><span>{t("fileOperation.download")}</span></button>}
       {onEdit && <button type="button" role="menuitem" style={fileMenuItemStyle} onClick={() => { setOpen(false); onEdit(); }}><FileMenuIcon action="edit" /><span>{t("fileEditor.edit")}</span></button>}
-      {root && !/^(?:\/|[A-Za-z]:)/.test(path) && <FileOperationItems root={root} path={path} onMove={() => { setOpen(false); setMoveOpen(true); }} onComplete={async () => { await onComplete?.(); setOpen(false); }} />}
+      {!rootIsDevice && root && !/^(?:\/|[A-Za-z]:)/.test(path) && <FileOperationItems root={root} path={path} onMove={() => { setOpen(false); setMoveOpen(true); }} onComplete={async () => { await onComplete?.(); setOpen(false); }} />}
     </div>}
     {moveOpen && <div style={menuOverlayStyle}><MoveFilePopover root={root} rootPath={rootPath} path={path} onComplete={async () => { setMoveOpen(false); await onComplete?.(); }} /></div>}
   </div>;
@@ -51,6 +51,8 @@ type RelatedSession = {
 
 type FileViewerProps = {
   rootPath?: string;
+  /** The file's root belongs to a remote device: hide edit/download/operate. */
+  rootIsDevice?: boolean;
   onFileOperationComplete?: () => void | Promise<void>;
   editStore: FileEditStore;
   onFileUpdated: (file: FilePayload) => void;
@@ -145,12 +147,12 @@ function Breadcrumbs({ root, path, onPathClick }: { root?: string; path: string;
   );
 }
 
-export function FileViewer({ rootPath, onFileOperationComplete, editStore, onFileUpdated, onFileSaved, file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true }: FileViewerProps) {
+export function FileViewer({ rootPath, rootIsDevice = false, onFileOperationComplete, editStore, onFileUpdated, onFileSaved, file, onSessionClick, onPathClick, onFileClick, onSelectionChange, initialScrollTop = 0, onScrollTopChange, isVisible = true }: FileViewerProps) {
   const { t } = useI18n();
   const showOutline = useSyncExternalStore(subscribeMarkdownOutline, isMarkdownOutlineEnabled, () => true);
   const editKey = fileEditKey(file?.root || "", file?.path || "");
   const editSession = useSyncExternalStore(editStore.subscribe, () => editStore.get(editKey));
-  const canEdit = !!file?.root && file.encoding === "utf-8" && file.size <= MAX_EDITABLE_FILE_BYTES
+  const canEdit = !rootIsDevice && !!file?.root && file.encoding === "utf-8" && file.size <= MAX_EDITABLE_FILE_BYTES
     && !/^(?:\/|[A-Za-z]:)/.test(file.path);
   const [isDownloading, setIsDownloading] = useState(false);
   const [editorActions, setEditorActions] = useState<HTMLSpanElement | null>(null);
@@ -459,7 +461,7 @@ export function FileViewer({ rootPath, onFileOperationComplete, editStore, onFil
           <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "2px", minWidth: 0, flexShrink: 0 }}>
             <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginLeft: "6px", flexShrink: 0, opacity: 0.7 }}>{(file.size / 1024).toFixed(1)} KB</div>
             <span className="file-editor-actions" ref={setEditorActions} />
-            {!editSession && <FileViewerMenu key={editKey} root={file.root || ""} rootPath={rootPath} path={file.path} downloading={isDownloading} onDownload={() => { void handleDownload(); }} onEdit={canEdit ? () => { void editStore.open(file.root!, file.path); } : undefined} onComplete={onFileOperationComplete} />}
+            {!editSession && <FileViewerMenu key={editKey} root={file.root || ""} rootPath={rootPath} rootIsDevice={rootIsDevice} path={file.path} downloading={isDownloading} onDownload={rootIsDevice ? undefined : () => { void handleDownload(); }} onEdit={canEdit ? () => { void editStore.open(file.root!, file.path); } : undefined} onComplete={onFileOperationComplete} />}
           </div>
       </header>
 

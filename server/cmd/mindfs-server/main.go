@@ -10,12 +10,18 @@ import (
 	"strings"
 	"syscall"
 
+	"mindfs/internal/remote"
 	"mindfs/server/app"
 )
 
 var version = "dev"
 
 func main() {
+	// __remote-agent shim: re-exec the agent command line over SSH. Must run
+	// before flag parsing; the marker argv arrives from the agent pool wrap.
+	if len(os.Args) > 1 && remote.IsShimArgv(os.Args[1:]) {
+		os.Exit(remote.RunShim(os.Args[1:]))
+	}
 	addr := flag.String("addr", "127.0.0.1:7331", "listen address")
 	noRelayer := flag.Bool("no-relayer", false, "disable relay integration")
 	webPushFlag := flag.Bool("web-push", true, "enable PWA Web Push notifications")

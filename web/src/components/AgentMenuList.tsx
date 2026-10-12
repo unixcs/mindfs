@@ -1,5 +1,6 @@
 import React from "react";
 import { AgentIcon } from "./AgentIcon";
+import { DeviceBadge } from "./DeviceBadge";
 import type { AgentStatus } from "../services/agents";
 import { useI18n } from "../i18n";
 
@@ -72,6 +73,9 @@ export function AgentMenuList({
             >
               {item.name}
             </span>
+            {item.device ? (
+              <DeviceBadge label={item.device_label || item.device} compact />
+            ) : null}
             {!item.available ? (
               <span
                 aria-label={t("agent.notReady")}

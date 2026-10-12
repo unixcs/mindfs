@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"mindfs/internal/remote"
 	"mindfs/server/internal/agent"
 	"mindfs/server/internal/api"
+	configpkg "mindfs/server/internal/config"
 	"mindfs/server/internal/e2ee"
 	"mindfs/server/internal/fs"
 	"mindfs/server/internal/githubimport"
@@ -99,9 +101,21 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 		relayBaseURL = agentConfig.RelayBaseURL
 	}
 	agentPool := agent.NewPool(agentConfig)
+	var remoteDevices *remote.Store
+	if configDir, err := configpkg.MindFSConfigDir(); err == nil {
+		devices, err := remote.NewStore(configDir)
+		if err != nil {
+			log.Printf("[remote] devices.init.error err=%v", err)
+		} else {
+			remoteDevices = devices
+			agentPool.SetDeviceSupport(devices.Resolver(), configDir)
+		}
+	} else {
+		log.Printf("[remote] configdir.error err=%v", err)
+	}
 	agentProber := agent.NewProber(&agentConfig, agentPool, 5*time.Minute)
 	agentProber.Start(ctx)
-	startHostedAgentConfigLoop(ctx, relayBaseURL, agentConfig, agentPool, agentProber)
+	startHostedAgentConfigLoop(ctx, relayBaseURL, opts.AgentConfigPath, agentConfig, agentPool, agentProber)
 	agentPool.StartIdleReleaseLoop(ctx, func() time.Duration {
 		hours := preferences.DefaultIdleSessionResourceReleaseHours
 		if prefs != nil {
@@ -122,11 +136,12 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	updateSvc.Start(ctx)
 
 	services := &api.AppContext{
-		Dirs:   registry,
-		Agents: agentPool,
-		Prober: agentProber,
-		Update: updateSvc,
-		Prefs:  prefs,
+		Dirs:    registry,
+		Agents:  agentPool,
+		Prober:  agentProber,
+		Devices: remoteDevices,
+		Update:  updateSvc,
+		Prefs:   prefs,
 		E2EE: e2ee.NewManager(e2ee.Config{
 			Enabled:       opts.E2EEConfig.Enabled,
 			NodeID:        opts.E2EEConfig.NodeID,
@@ -219,7 +234,7 @@ func Start(ctx context.Context, addr string, opts StartOptions) error {
 	return server.Serve(listener)
 }
 
-func startHostedAgentConfigLoop(ctx context.Context, relayBaseURL string, localConfig agent.Config, pool *agent.Pool, prober *agent.Prober) {
+func startHostedAgentConfigLoop(ctx context.Context, relayBaseURL string, agentConfigPath string, localConfig agent.Config, pool *agent.Pool, prober *agent.Prober) {
 	endpoint, err := hostedAgentsURL(relayBaseURL)
 	if err != nil {
 		log.Printf("[agents/hosted] disabled invalid_relay_base_url=%q err=%v", relayBaseURL, err)
@@ -227,12 +242,25 @@ func startHostedAgentConfigLoop(ctx context.Context, relayBaseURL string, localC
 	}
 	go func() {
 		refresh := func() {
-			merged, err := fetchHostedAgentConfig(ctx, endpoint, localConfig)
+			// Re-read the user agents.json each round so agents written at
+			// runtime (e.g. device agents provisioned from the panel) survive
+			// hosted merges instead of being rolled back to the boot snapshot.
+			local := localConfig
+			if loaded, err := agent.LoadConfigWithExtra(agentConfigPath); err == nil {
+				local = loaded
+			} else {
+				log.Printf("[agents/hosted] local.reload.error err=%v", err)
+			}
+			merged, err := fetchHostedAgentConfig(ctx, endpoint, local)
 			if err != nil {
 				log.Printf("[agents/hosted] refresh.error url=%s err=%v", endpoint, err)
 				return
 			}
-			effective := pool.UpdateConfig(merged)
+			// MergeHostedConfig keeps the pool's current device agents: the
+			// disk snapshot read above may be stale relative to a device
+			// provision/delete that ran concurrently (device agents are
+			// managed atomically inside the pool).
+			effective := pool.MergeHostedConfig(merged)
 			prober.UpdateConfig(ctx, &effective)
 			log.Printf("[agents/hosted] refresh.ok url=%s agents=%d", endpoint, len(effective.Agents))
 		}

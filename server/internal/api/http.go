@@ -402,6 +402,20 @@ func (h *HTTPHandler) Routes() http.Handler {
 	r.Post("/api/dirs/{id}/rename", h.protectedEndpoint(h.handleRenameDir))
 	r.Delete("/api/dirs", h.protectedEndpoint(h.handleRemoveDir))
 	r.Get("/api/local_dirs", h.protectedEndpoint(h.handleLocalDirs))
+
+	// 多设备 CLI 聚合: device management API. Device endpoints follow the same
+	// exposure policy as the preferences/agents endpoints (protectedEndpoint =
+	// session auth + e2ee): they are part of the authenticated web API and get
+	// no special relay-side treatment. isLocalCLIPath only concerns CLI-token
+	// passthrough for session message relaying, which device routes never
+	// touch, so nothing needs to be added to that whitelist.
+	r.Get("/api/devices", h.protectedEndpoint(h.handleDevicesList))
+	r.Post("/api/devices", h.protectedEndpoint(h.handleDeviceCreate))
+	r.Delete("/api/devices/{id}", h.protectedEndpoint(h.handleDeviceDelete))
+	r.Post("/api/devices/{id}/test", h.protectedEndpoint(h.handleDeviceTest))
+	r.Post("/api/devices/{id}/scan", h.protectedEndpoint(h.handleDeviceScan))
+	r.Post("/api/devices/{id}/roots", h.protectedEndpoint(h.handleDeviceRootCreate))
+	r.Post("/api/devices/{id}/sync", h.protectedEndpoint(h.handleDeviceSync))
 	r.Get("/api/relay/status", h.handleRelayStatus)
 	r.Post("/api/relay/bind/start", h.protectedEndpoint(h.handleRelayBindStart))
 	r.Get("/api/token-station/userinfo", h.protectedEndpoint(h.handleTokenStationUserInfo))
@@ -541,6 +555,9 @@ func (h *HTTPHandler) handleMultiRootSessions(w http.ResponseWriter, r *http.Req
 			"pinned_items":        pinnedItems,
 			"pinned_keys":         group.PinnedKeys,
 			"total_count":         group.TotalCount,
+			// 多设备 CLI 聚合: device roots carry their owning device.
+			"device":       group.Device,
+			"device_label": group.DeviceLabel,
 		})
 	}
 	respondJSON(w, http.StatusOK, map[string]any{"groups": groups})
@@ -2751,6 +2768,13 @@ func managedDirResponse(dir fs.RootInfo) map[string]any {
 		"meta_location": dir.EffectiveMetaLocation(),
 		"created_at":    dir.CreatedAt,
 		"updated_at":    dir.UpdatedAt,
+		// Device roots are remote machines: the file tree groups by this key
+		// and skips every local stat below (RootPath is a remote path string —
+		// statting it would read a same-named local directory).
+		"device": dir.Device,
+	}
+	if dir.Device != "" {
+		return resp
 	}
 	if info, err := dir.StatRoot(); err == nil {
 		resp["size"] = info.Size()

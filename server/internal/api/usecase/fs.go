@@ -50,13 +50,16 @@ type GetFileInfoOutput struct {
 	MTime time.Time
 }
 
-func (s *Service) ListTree(_ context.Context, in ListTreeInput) (ListTreeOutput, error) {
+func (s *Service) ListTree(ctx context.Context, in ListTreeInput) (ListTreeOutput, error) {
 	if err := s.ensureRegistry(); err != nil {
 		return ListTreeOutput{}, err
 	}
 	root, err := s.Registry.GetRoot(in.RootID)
 	if err != nil {
 		return ListTreeOutput{}, err
+	}
+	if root.Device != "" {
+		return s.listTreeDeviceRoot(ctx, root, in.Dir)
 	}
 	dir := in.Dir
 	if dir == "" || dir == "." {
@@ -113,6 +116,9 @@ func (s *Service) OpenFileRaw(_ context.Context, in OpenFileRawInput) (OpenFileR
 	if err != nil {
 		return OpenFileRawOutput{}, err
 	}
+	if err := rejectDeviceRoot(root); err != nil {
+		return OpenFileRawOutput{}, errors.New("远程设备文件不支持二进制流（raw）下载，本期仅支持文本读取")
+	}
 	if in.Path == "" {
 		return OpenFileRawOutput{}, errors.New("path required")
 	}
@@ -130,7 +136,7 @@ func (s *Service) OpenFileRaw(_ context.Context, in OpenFileRawInput) (OpenFileR
 	return OpenFileRawOutput{File: file, Info: info, RelPath: relPath}, nil
 }
 
-func (s *Service) GetFileInfo(_ context.Context, in GetFileInfoInput) (GetFileInfoOutput, error) {
+func (s *Service) GetFileInfo(ctx context.Context, in GetFileInfoInput) (GetFileInfoOutput, error) {
 	if err := s.ensureRegistry(); err != nil {
 		return GetFileInfoOutput{}, err
 	}
@@ -140,6 +146,9 @@ func (s *Service) GetFileInfo(_ context.Context, in GetFileInfoInput) (GetFileIn
 	}
 	if in.Path == "" {
 		return GetFileInfoOutput{}, errors.New("path required")
+	}
+	if root.Device != "" {
+		return s.getFileInfoDeviceRoot(ctx, root, in.Path)
 	}
 	target, path, external, err := resolveFileReadTarget(root, in.Path)
 	if err != nil {
@@ -188,8 +197,11 @@ func (s *Service) SaveUploadedFiles(_ context.Context, in SaveUploadedFilesInput
 	if err := s.ensureRegistry(); err != nil {
 		return SaveUploadedFilesOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
+		return SaveUploadedFilesOutput{}, err
+	}
+	if err := rejectDeviceRoot(root); err != nil {
 		return SaveUploadedFilesOutput{}, err
 	}
 	if len(in.Files) == 0 {
@@ -304,6 +316,10 @@ func (s *Service) ReadFile(ctx context.Context, in ReadFileInput) (ReadFileOutpu
 	if in.Path == "" {
 		return ReadFileOutput{}, errors.New("path required")
 	}
+	if root.Device != "" {
+		// 设备根：远程读取，不建 watcher，也无本地 file meta。
+		return s.readFileDeviceRoot(ctx, root, in.Path, in)
+	}
 	target, path, external, err := resolveFileReadTarget(root, in.Path)
 	if err != nil {
 		return ReadFileOutput{}, err
@@ -345,7 +361,7 @@ func (s *Service) GetGitStatus(ctx context.Context, in GitStatusInput) (GitStatu
 	if err := s.ensureRegistry(); err != nil {
 		return GitStatusOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return GitStatusOutput{}, err
 	}
@@ -360,7 +376,7 @@ func (s *Service) GetGitDiff(ctx context.Context, in GitDiffInput) (GitDiffOutpu
 	if err := s.ensureRegistry(); err != nil {
 		return GitDiffOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return GitDiffOutput{}, err
 	}
@@ -400,7 +416,7 @@ func (s *Service) GetGitHistory(ctx context.Context, in GitHistoryInput) (GitHis
 	if err := s.ensureRegistry(); err != nil {
 		return GitHistoryOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return GitHistoryOutput{}, err
 	}
@@ -415,7 +431,7 @@ func (s *Service) GetGitCommitFiles(ctx context.Context, in GitCommitFilesInput)
 	if err := s.ensureRegistry(); err != nil {
 		return GitCommitFilesOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return GitCommitFilesOutput{}, err
 	}
@@ -433,7 +449,7 @@ func (s *Service) GetGitCommitDiff(ctx context.Context, in GitCommitDiffInput) (
 	if err := s.ensureRegistry(); err != nil {
 		return GitCommitDiffOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return GitCommitDiffOutput{}, err
 	}
@@ -463,7 +479,7 @@ func (s *Service) GetGitRelatedFileDiff(ctx context.Context, in GitRelatedFileDi
 	if err := s.ensureRegistry(); err != nil {
 		return GitRelatedFileDiffOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return GitRelatedFileDiffOutput{}, err
 	}
@@ -919,6 +935,9 @@ func (s *Service) RemoveManagedDir(_ context.Context, in RemoveManagedDirInput) 
 	if !filepath.IsAbs(in.Path) {
 		return RemoveManagedDirOutput{}, errors.New("path must be absolute")
 	}
+	if err := rejectDeviceRootByPath(s, filepath.Clean(in.Path)); err != nil {
+		return RemoveManagedDirOutput{}, err
+	}
 	dir, err := s.Registry.RemoveRoot(filepath.Clean(in.Path))
 	if err != nil {
 		return RemoveManagedDirOutput{}, err
@@ -961,6 +980,9 @@ func (s *Service) RenameManagedDir(_ context.Context, in RenameManagedDirInput) 
 
 	root, err := s.Registry.GetRoot(rootID)
 	if err != nil {
+		return RenameManagedDirOutput{}, err
+	}
+	if err := rejectDeviceRoot(root); err != nil {
 		return RenameManagedDirOutput{}, err
 	}
 	oldPath := filepath.Clean(root.RootPath)

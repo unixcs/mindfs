@@ -51,6 +51,7 @@ type RootInfo struct {
 	Name         string    `json:"name"`
 	RootPath     string    `json:"root_path"`
 	MetaLocation string    `json:"meta_location,omitempty"`
+	Device       string    `json:"device,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }

@@ -25,3 +25,6 @@ harmony/.idea/
 harmony/.appanalyzer/
 harmony/local.properties
 harmony/entry/src/main/resources/rawfile/public/
+# multi-device worktree build/test artifacts (batch v67)
+/bin/
+/test-home/

@@ -25,6 +25,9 @@ import { AgentIcon } from "./AgentIcon";
 import { AgentSelector } from "./AgentSelector";
 import { SymlinkBadge } from "./SymlinkBadge";
 import { RelayLocalServicesDialog } from "./RelayLocalServicesDialog";
+import { DeviceBadge, DeviceFilterChip } from "./DeviceBadge";
+import { DeviceSettingsSection } from "./DeviceSettingsSection";
+import { deviceDisplayName, type Device } from "../services/devices";
 import { fetchAgentCatalog, fetchAgents, type AgentStatus } from "../services/agents";
 import {
   applyProviderToAgents,
@@ -229,6 +232,17 @@ type FileTreeProps = {
   onRestartAgent?: (agentName: string) => void | Promise<void>;
   onGoHome?: () => void;
   footerTopContent?: React.ReactNode;
+  /** 多设备 CLI 聚合: enabled remote devices (chips + settings section). */
+  devices?: Device[];
+  /** device id → provisioned device agent count (delete confirm hint). */
+  agentCountByDevice?: Record<string, number>;
+  /** 多设备显示开关（文件树 + 会话列表共用）；默认单设备。 */
+  multiDeviceViewEnabled?: boolean;
+  onMultiDeviceViewChange?: (enabled: boolean) => void;
+  /** Register a scanned remote path as a managed root (existing add-dir flow). */
+  onAddDeviceRoot?: (device: Device, path: string) => Promise<void>;
+  /** Refresh the parent's device list after device mutations. */
+  onDevicesChanged?: () => void;
 };
 
 type AgentConfigFlow = "backup" | "switch";
@@ -1973,6 +1987,12 @@ export function FileTree({
   onRestartAgent,
   onGoHome,
   footerTopContent,
+  devices = [],
+  agentCountByDevice = {},
+  multiDeviceViewEnabled = false,
+  onMultiDeviceViewChange,
+  onAddDeviceRoot,
+  onDevicesChanged,
 }: FileTreeProps) {
   const { locale, setLocale, t } = useI18n();
   const sortLabel = React.useCallback((mode: DirectorySortMode): string => {
@@ -2068,6 +2088,12 @@ export function FileTree({
   const [agentLifecycleOpen, setAgentLifecycleOpen] = React.useState(false);
   const [relayServicesOpen, setRelayServicesOpen] = React.useState(false);
   const [relayServicesEditing, setRelayServicesEditing] = React.useState(false);
+  const [deviceSettingsOpen, setDeviceSettingsOpen] = React.useState(false);
+  const [deviceSettingsEditing, setDeviceSettingsEditing] = React.useState(false);
+  const deviceSettingsPopoverRef = React.useRef<HTMLDivElement | null>(null);
+  // 多设备文件树：null = 全部设备（按设备分组），"" = 本机，其余 = 设备 id
+  const [deviceTreeFilter, setDeviceTreeFilter] = React.useState<string | null>(null);
+  const [expandedDeviceGroups, setExpandedDeviceGroups] = React.useState<Record<string, boolean>>({});
   const [agentLifecycleAgents, setAgentLifecycleAgents] = React.useState<AgentStatus[]>([]);
   const [agentLifecycleBusy, setAgentLifecycleBusy] = React.useState(false);
   const [agentLifecycleRunningAgent, setAgentLifecycleRunningAgent] = React.useState("");
@@ -2605,7 +2631,9 @@ export function FileTree({
     setAgentConfigBusy(true);
     fetchAgents(true)
       .then((items) => {
-        setAgentConfigAgents(items.filter((item) => item.installed));
+        // 设备代理的 CLI 配置在远端设备上，备份/切换/供应商写的是主舱本地
+        // CLI 配置文件，对设备代理语义错误，直接排除出配置流程。
+        setAgentConfigAgents(items.filter((item) => item.installed && !item.device));
       })
       .catch((error) => {
         setAgentConfigError(error instanceof Error ? error.message : t("agentConfig.loadAgentFailed"));
@@ -2805,7 +2833,8 @@ export function FileTree({
     setAgentConfigBusy(true);
     fetchAgents(true)
       .then((items) => {
-        setAgentConfigAgents(items.filter((item) => item.installed));
+        // 同上：设备代理不支持本地 CLI 配置写入（备份/切换/供应商 apply）。
+        setAgentConfigAgents(items.filter((item) => item.installed && !item.device));
       })
       .catch((error) => {
         setAgentConfigError(error instanceof Error ? error.message : t("agentConfig.loadAgentFailed"));
@@ -2835,7 +2864,8 @@ export function FileTree({
     setAgentLifecycleBusy(true);
     fetchAgentCatalog(true)
       .then((items) => {
-        setAgentLifecycleAgents(items);
+        // 安装/更新命令跑在主舱本机，对远程设备代理无意义。
+        setAgentLifecycleAgents(items.filter((item) => !item.device));
       })
       .catch((error) => {
         setAgentLifecycleError(error instanceof Error ? error.message : t("agentConfig.loadAgentFailed"));
@@ -2890,6 +2920,22 @@ export function FileTree({
     document.addEventListener("mousedown", handlePointerDown);
     return () => document.removeEventListener("mousedown", handlePointerDown);
   }, [relayServicesEditing, relayServicesOpen]);
+
+  React.useEffect(() => {
+    if (!deviceSettingsOpen) {
+      return;
+    }
+    const handlePointerDown = (event: MouseEvent) => {
+      if (deviceSettingsEditing) {
+        return;
+      }
+      if (!deviceSettingsPopoverRef.current?.contains(event.target as Node)) {
+        setDeviceSettingsOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, [deviceSettingsEditing, deviceSettingsOpen]);
 
   const closeRelayServices = React.useCallback(() => {
     setRelayServicesOpen(false);
@@ -3321,6 +3367,73 @@ export function FileTree({
     return hiddenFiltered.filter((entry) => !!rootId && entry.path === rootId);
   }, [projectTreeTab, rootId, showHiddenFiles]);
 
+  // 多设备 CLI 聚合: group managed roots by owning device. Local roots first,
+  // then devices in configured order; roots of unknown/disabled devices stay
+  // visible at the end so nothing silently disappears.
+  const deviceTreeActive = multiDeviceViewEnabled && devices.length > 0;
+  const deviceTreeGroups = React.useMemo(() => {
+    if (!deviceTreeActive) {
+      return null;
+    }
+    const byKey = new Map<string, { key: string; label: string; entries: FileEntry[] }>();
+    for (const entry of entries) {
+      const deviceKey = String(entry.device ?? "");
+      let group = byKey.get(deviceKey);
+      if (!group) {
+        const device = deviceKey ? devices.find((item) => item.id === deviceKey) : null;
+        group = {
+          key: deviceKey,
+          // Unknown device ids (device deleted elsewhere, partial device load)
+          // must not be labelled as 本机 — show the raw id instead.
+          label: device ? deviceDisplayName(device) : deviceKey || t("device.local"),
+          entries: [],
+        };
+        byKey.set(deviceKey, group);
+      }
+      group.entries.push(entry);
+    }
+    const groups: Array<{ key: string; label: string; entries: FileEntry[] }> = [];
+    const localGroup = byKey.get("");
+    if (localGroup) {
+      groups.push(localGroup);
+    }
+    for (const device of devices) {
+      const group = byKey.get(device.id);
+      if (group) {
+        groups.push(group);
+      }
+    }
+    for (const [key, group] of byKey) {
+      if (key !== "" && !devices.some((item) => item.id === key)) {
+        groups.push(group);
+      }
+    }
+    return groups;
+  }, [deviceTreeActive, entries, devices, t]);
+  const toggleDeviceGroup = React.useCallback((key: string) => {
+    // undefined = expanded (default); the flag only stores explicit collapses.
+    setExpandedDeviceGroups((prev) => ({ ...prev, [key]: prev[key] === false ? true : false }));
+  }, []);
+  // Device roots are read-only this phase (browse only): git/worktrees/related
+  // tabs run local analysis against RootPath, so hide them instead of letting
+  // every click end in "远程设备目录只读".
+  const currentRootIsDevice = React.useMemo(() => {
+    if (!rootId) return false;
+    const rootEntry = entries.find((item) => item.is_root && item.path === rootId);
+    return !!String(rootEntry?.device ?? "");
+  }, [entries, rootId]);
+  React.useEffect(() => {
+    if (currentRootIsDevice && projectTreeTab !== "files") {
+      setProjectTreeTab("files");
+    }
+  }, [currentRootIsDevice, projectTreeTab]);
+  const deviceTreeFilterEntries = React.useMemo(() => {
+    if (!deviceTreeActive || deviceTreeFilter === null) {
+      return null;
+    }
+    return entries.filter((entry) => String(entry.device ?? "") === deviceTreeFilter);
+  }, [deviceTreeActive, deviceTreeFilter, entries]);
+
   const fontSizeRows: Array<{ region: FontSizeRegion; labelKey: MessageKey }> = [
     { region: "fileSidebar", labelKey: "fileTree.fontSizeFileSidebar" },
     { region: "main", labelKey: "fileTree.fontSizeMain" },
@@ -3601,7 +3714,7 @@ export function FileTree({
               ["git", "git"],
               ["worktrees", t("fileTree.worktrees")],
               ["related", t("fileTree.relatedFiles")],
-            ] as const).map(([value, label], index) => {
+            ] as const).filter(([value]) => !currentRootIsDevice || value === "files").map(([value, label], index) => {
               const active = projectTreeTab === value;
               const flexGrow = value === "related" ? 1.45 : value === "worktrees" ? 1.15 : 0.85;
               return (
@@ -3867,6 +3980,28 @@ export function FileTree({
                     <path d="m21 3-9 9" />
                   </svg>
                   <span>{t("fileTree.relayLocalServices")}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeviceSettingsOpen(true);
+                    setDeviceSettingsEditing(false);
+                    closeAgentConfigFlow();
+                    setAgentLifecycleOpen(false);
+                    setRelayServicesOpen(false);
+                    setIsMenuOpen(false);
+                    setIsAppearanceMenuOpen(false);
+                    setIsLocaleMenuOpen(false);
+                    setIsSortMenuOpen(false);
+                  }}
+                  style={fileTreeMenuButtonStyle}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <rect x="2" y="4" width="20" height="13" rx="2" />
+                    <path d="M8 21h8" />
+                    <path d="M12 17v4" />
+                  </svg>
+                  <span>{t("fileTree.remoteDevices")}</span>
                 </button>
                 {!isNativeApp ? <WebPushMenuItem /> : null}
                 <div style={{ height: "1px", background: "var(--border-color)", margin: "6px 4px" }} />
@@ -4910,8 +5045,76 @@ export function FileTree({
             />
           </div>
         ) : null}
+        {deviceSettingsOpen ? (
+          <div
+            ref={deviceSettingsPopoverRef}
+            style={{
+              position: "absolute",
+              top: "calc(100% + 6px)",
+              left: "8px",
+              right: "3px",
+              zIndex: 35,
+            }}
+          >
+            <DeviceSettingsSection
+              open={deviceSettingsOpen}
+              devices={devices}
+              agentCountByDevice={agentCountByDevice}
+              multiDeviceViewEnabled={multiDeviceViewEnabled}
+              onMultiDeviceViewChange={(enabled) => onMultiDeviceViewChange?.(enabled)}
+              onDevicesChanged={() => onDevicesChanged?.()}
+              onAddDeviceRoot={async (device, path) => {
+                if (!onAddDeviceRoot) {
+                  return;
+                }
+                await onAddDeviceRoot(device, path);
+              }}
+              onCancel={() => setDeviceSettingsOpen(false)}
+              onEditingChange={setDeviceSettingsEditing}
+            />
+          </div>
+        ) : null}
       </div>
       <div style={{ padding: "8px", flex: 1, minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column" }}>
+        {multiDeviceViewEnabled && devices.length > 0 && entries.length > 0 ? (
+          <div
+            className="mindfs-device-chip-row"
+            role="group"
+            aria-label={t("devices.chipGroup")}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              padding: "0 0 8px",
+              overflowX: "auto",
+              overflowY: "hidden",
+              flexShrink: 0,
+              scrollbarWidth: "none",
+            }}
+          >
+            <style>{`
+              .mindfs-device-chip-row::-webkit-scrollbar { display: none; }
+            `}</style>
+            <DeviceFilterChip
+              label={t("devices.all")}
+              active={deviceTreeFilter === null}
+              onClick={() => setDeviceTreeFilter(null)}
+            />
+            <DeviceFilterChip
+              label={t("device.local")}
+              active={deviceTreeFilter === ""}
+              onClick={() => setDeviceTreeFilter("")}
+            />
+            {devices.map((device) => (
+              <DeviceFilterChip
+                key={device.id}
+                label={deviceDisplayName(device)}
+                active={deviceTreeFilter === device.id}
+                onClick={() => setDeviceTreeFilter(device.id)}
+              />
+            ))}
+          </div>
+        ) : null}
         {entries.length === 0 && creatingRootName === null ? (
           <div
             style={{
@@ -4930,6 +5133,66 @@ export function FileTree({
           >
             {t("fileTree.emptyProjectHint")}
           </div>
+        ) : deviceTreeGroups && deviceTreeFilter === null ? (
+          // 全部设备：按设备分组渲染，组头可折叠
+          <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+            {deviceTreeGroups.map((group) => {
+              const groupExpanded = expandedDeviceGroups[group.key] !== false;
+              const showHeader = deviceTreeGroups.length > 1;
+              return (
+                <div key={group.key || "__local__"} style={{ minWidth: 0 }}>
+                  {showHeader ? (
+                    <button
+                      type="button"
+                      aria-expanded={groupExpanded}
+                      onClick={() => toggleDeviceGroup(group.key)}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "5px",
+                        width: "100%",
+                        border: "none",
+                        background: "transparent",
+                        color: "var(--text-secondary)",
+                        padding: "4px 0",
+                        cursor: "pointer",
+                        textAlign: "left",
+                      }}
+                    >
+                      <ChevronRight isOpen={groupExpanded} />
+                      <DeviceBadge label={group.label} />
+                      <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                        {t("devices.groupRootCount", { count: group.entries.length })}
+                      </span>
+                    </button>
+                  ) : null}
+                  {groupExpanded ? renderEntries(group.entries, 0, rootId || "") : null}
+                </div>
+              );
+            })}
+          </div>
+        ) : deviceTreeFilterEntries ? (
+          deviceTreeFilterEntries.length > 0 ? (
+            renderEntries(deviceTreeFilterEntries, 0, rootId || "")
+          ) : (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                padding: "20px",
+                textAlign: "center",
+                color: "var(--text-secondary)",
+                fontSize: "12px",
+                fontWeight: 600,
+                lineHeight: 1.5,
+              }}
+            >
+              {t("devices.noRootsForDevice")}
+            </div>
+          )
         ) : (
           renderEntries(entries, 0, rootId || "")
         )}

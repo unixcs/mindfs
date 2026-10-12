@@ -372,4 +372,8 @@ func (r *syncDeltaTestRegistry) GetFileWatcher(string, *session.Manager) (*fs.Sh
 	return nil, nil
 }
 
+func (r syncDeltaTestRegistry) GetDeviceRuntime() (DeviceRuntime, bool) {
+	return DeviceRuntime{}, false
+}
+
 func (r *syncDeltaTestRegistry) ReleaseFileWatcher(string, string) {}

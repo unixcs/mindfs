@@ -24,7 +24,7 @@ func (s *Service) ListGitBranches(ctx context.Context, in ListGitBranchesInput) 
 	if err := s.ensureRegistry(); err != nil {
 		return ListGitBranchesOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return ListGitBranchesOutput{}, err
 	}
@@ -48,7 +48,7 @@ func (s *Service) CheckoutGitBranch(ctx context.Context, in CheckoutGitBranchInp
 	if err := s.ensureRegistry(); err != nil {
 		return CheckoutGitBranchOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return CheckoutGitBranchOutput{}, err
 	}
@@ -154,7 +154,7 @@ func (s *Service) gitActionRoot(rootID string) (fs.RootInfo, error) {
 	if err := s.ensureRegistry(); err != nil {
 		return fs.RootInfo{}, err
 	}
-	root, err := s.Registry.GetRoot(rootID)
+	root, err := s.ensureWritableLocalRoot(rootID)
 	if err != nil {
 		return fs.RootInfo{}, err
 	}
@@ -173,7 +173,7 @@ func (s *Service) ListGitWorktrees(ctx context.Context, in ListGitWorktreesInput
 	if err := s.ensureRegistry(); err != nil {
 		return ListGitWorktreesOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return ListGitWorktreesOutput{}, err
 	}
@@ -201,7 +201,7 @@ func (s *Service) CreateGitWorktree(ctx context.Context, in CreateGitWorktreeInp
 	if err := s.ensureRegistry(); err != nil {
 		return CreateGitWorktreeOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return CreateGitWorktreeOutput{}, err
 	}
@@ -284,7 +284,7 @@ func (s *Service) RemoveGitWorktree(ctx context.Context, in RemoveGitWorktreeInp
 	if err := s.ensureRegistry(); err != nil {
 		return RemoveGitWorktreeOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return RemoveGitWorktreeOutput{}, err
 	}

@@ -381,7 +381,7 @@ func TestProbeInstalledAgentWithPoolSkipsMissingCommand(t *testing.T) {
 		Name:    "missing-agent",
 		Command: "mindfs-test-agent-command-that-does-not-exist",
 	}
-	status := probeInstallStatus(def.Name, def, time.Now().UTC())
+	status := probeInstallStatus(def.Name, def, time.Now().UTC(), nil, false)
 	if status.Installed {
 		t.Fatalf("test command unexpectedly exists in PATH")
 	}

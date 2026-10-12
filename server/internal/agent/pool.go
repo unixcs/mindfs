@@ -3,17 +3,23 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"mindfs/internal/remote"
 	"mindfs/server/internal/agent/acp"
 	"mindfs/server/internal/agent/claude"
 	"mindfs/server/internal/agent/codex"
 	agenttypes "mindfs/server/internal/agent/types"
 )
+
+// DeviceResolver looks up a remote device config by ID.
+type DeviceResolver func(id string) (remote.Device, bool)
 
 // Pool routes agent session creation to protocol-specific runtimes.
 type Pool struct {
@@ -32,6 +38,9 @@ type Pool struct {
 	memoryMu        sync.RWMutex
 	memoryCollectMu sync.Mutex
 	memorySnapshot  MemorySnapshot
+	deviceMu        sync.RWMutex
+	deviceResolver  DeviceResolver
+	deviceConfigDir string
 }
 
 type sessionEntry struct {
@@ -80,6 +89,109 @@ func (p *Pool) SupportsDeveloperInstructions(agentName string) bool {
 	return protocol == ProtocolCodexSDK || protocol == ProtocolClaudeSDK
 }
 
+// SetDeviceSupport wires remote device support: resolver looks up devices
+// by ID, configDir locates devices.json and the ssh mux dir.
+func (p *Pool) SetDeviceSupport(resolver DeviceResolver, configDir string) {
+	p.deviceMu.Lock()
+	defer p.deviceMu.Unlock()
+	p.deviceResolver = resolver
+	p.deviceConfigDir = configDir
+}
+
+func (p *Pool) deviceSupport() (DeviceResolver, string) {
+	p.deviceMu.RLock()
+	defer p.deviceMu.RUnlock()
+	return p.deviceResolver, p.deviceConfigDir
+}
+
+// resolveDeviceAgent rewrites a device-scoped definition into a local spawn
+// of the __remote-agent shim. The shim re-execs ssh carrying the original
+// command line (MINDFS_REMOTE_CMDLINE) plus any argv tokens the protocol
+// SDK appended around the marker.
+func (p *Pool) resolveDeviceAgent(def Definition, in agenttypes.OpenSessionInput) (Definition, agenttypes.OpenSessionInput, error) {
+	if strings.TrimSpace(def.Device) == "" {
+		return def, in, nil
+	}
+	resolver, configDir := p.deviceSupport()
+	if resolver == nil || configDir == "" {
+		return def, in, fmt.Errorf("agent %q targets device %q but device support is not configured", def.Name, def.Device)
+	}
+	device, ok := resolver(def.Device)
+	if !ok {
+		return def, in, fmt.Errorf("device %q is not configured", def.Device)
+	}
+	if !device.Enabled {
+		return def, in, fmt.Errorf("device %q is disabled", device.DisplayName())
+	}
+	selfExe, err := os.Executable()
+	if err != nil {
+		return def, in, fmt.Errorf("resolve self executable: %w", err)
+	}
+	remoteCwd := strings.TrimSpace(def.ResolveCwd(in.RootPath))
+	if remoteCwd == "" {
+		remoteCwd = "~"
+	}
+	if remoteCwd != "~" && strings.HasPrefix(remoteCwd, "/") {
+		// The cwd lives on the device. Some ACP CLIs (qoder) refuse to start
+		// in a remote directory that does not exist, so materialize it first;
+		// for a registered device root this is an idempotent no-op. Best
+		// effort: under transient ssh mux contention a failure must not kill
+		// the whole spawn — CLIs that need the dir report it themselves.
+		if err := ensureDeviceDir(device, configDir, remoteCwd); err != nil {
+			log.Printf("[agent/pool] prepare cwd %s on %s failed (continuing): %v", remoteCwd, device.DisplayName(), err)
+		}
+	}
+	cmdline := append([]string{def.Command}, def.Args...)
+	// cloneEnv returns nil for an empty def.Env; the overlay write below
+	// would panic on a nil map, so materialize it here.
+	env := cloneEnv(def.Env)
+	if env == nil {
+		env = make(map[string]string, 8)
+	}
+	overlay, err := remote.DeviceSpawnEnv(configDir, device.ID, remoteCwd, device.PathPrefix, cmdline)
+	if err != nil {
+		return def, in, err
+	}
+	for key, value := range overlay {
+		env[key] = value
+	}
+	wrapped := def
+	wrapped.Command = selfExe
+	wrapped.Args = []string{remote.EnvMarker}
+	wrapped.Env = env
+	wrapped.CwdTemplate = ""
+	// claude SDK stats the local cwd before spawning; the remote cwd is
+	// carried by MINDFS_REMOTE_CWD instead.
+	if effectiveProtocol(def.Name, def.Protocol) == ProtocolClaudeSDK {
+		in.RootPath = ""
+	}
+	return wrapped, in, nil
+}
+
+func effectiveProtocol(name string, protocol Protocol) Protocol {
+	if protocol != "" {
+		return protocol
+	}
+	return DefaultProtocol(name)
+}
+
+// ensureDeviceDir creates dir on the device (mkdir -p) so remote CLIs that
+// validate their working directory can start.
+func ensureDeviceDir(device remote.Device, configDir, dir string) error {
+	muxDir, err := remote.MuxDir(configDir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err = remote.Run(ctx, device.Target(), muxDir, "mkdir -p "+remote.Quote(dir), 12*time.Second); err == nil {
+		return nil
+	}
+	time.Sleep(300 * time.Millisecond)
+	_, err = remote.Run(ctx, device.Target(), muxDir, "mkdir -p "+remote.Quote(dir), 12*time.Second)
+	return err
+}
+
 // GetOrCreate returns an existing session handle or creates a new one.
 func (p *Pool) GetOrCreate(ctx context.Context, in agenttypes.OpenSessionInput) (agenttypes.Session, error) {
 	if in.SessionKey == "" {
@@ -113,11 +225,16 @@ retryExisting:
 		p.mu.Unlock()
 		return nil, errors.New("agent not configured: " + in.AgentName)
 	}
-	protocol := def.Protocol
-	if protocol == "" {
-		protocol = DefaultProtocol(in.AgentName)
-	}
 	p.mu.Unlock()
+
+	// Remote device agents spawn the local __remote-agent shim, which
+	// re-execs ssh; rewrite def/in before protocol dispatch.
+	def, in, deviceErr := p.resolveDeviceAgent(def, in)
+	if deviceErr != nil {
+		return nil, deviceErr
+	}
+
+	protocol := effectiveProtocol(in.AgentName, def.Protocol)
 	unlockRuntime := p.lockRuntimeGroups([]runtimeGroup{{agentName: in.AgentName, protocol: protocol}})
 	defer unlockRuntime()
 
@@ -394,6 +511,12 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 	case ProtocolACP:
 		fallthrough
 	default:
+		cwd := def.ResolveCwd(in.RootPath)
+		if strings.TrimSpace(def.Device) != "" {
+			// The cwd is a remote path; acp.Start must not set the
+			// local cmd.Dir to it. The shim cds remotely instead.
+			cwd = ""
+		}
 		return p.acp.OpenSession(ctx, acp.OpenOptions{
 			AgentName:       in.AgentName,
 			SessionKey:      in.SessionKey,
@@ -404,7 +527,7 @@ func (p *Pool) openSession(ctx context.Context, protocol Protocol, def Definitio
 			Command:         def.Command,
 			Args:            def.BuildArgs(in.RootPath),
 			Env:             cloneEnv(def.Env),
-			Cwd:             def.ResolveCwd(in.RootPath),
+			Cwd:             cwd,
 			ResumeSessionID: in.AgentSessionID,
 		})
 	}
@@ -564,6 +687,79 @@ func (p *Pool) codexRuntimeOptions(agentName string) (codex.OpenOptions, error) 
 func (p *Pool) UpdateConfig(cfg Config) Config {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	cfg = p.applyRuntimeEnvOverridesLocked(cfg)
+	p.cfg = cfg
+	return p.cfg
+}
+
+// UpsertDeviceAgents atomically adds device agent definitions to the live
+// pool config (existing names are left untouched). Doing the read-modify-write
+// under the pool lock prevents a concurrent hosted-config refresh from
+// rolling the additions back with a stale snapshot.
+func (p *Pool) UpsertDeviceAgents(defs []Definition) (Config, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	changed := false
+	for _, def := range defs {
+		if strings.TrimSpace(def.Device) == "" {
+			continue
+		}
+		if _, exists := p.cfg.GetAgent(def.Name); exists {
+			continue
+		}
+		p.cfg.Agents = append(p.cfg.Agents, def)
+		changed = true
+	}
+	if changed {
+		p.cfg = p.applyRuntimeEnvOverridesLocked(p.cfg)
+	}
+	return p.cfg, changed
+}
+
+// RemoveDeviceAgents drops every agent whose Device marker matches deviceID
+// from the live pool config, atomically.
+func (p *Pool) RemoveDeviceAgents(deviceID string) (Config, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := make([]Definition, 0, len(p.cfg.Agents))
+	changed := false
+	for _, def := range p.cfg.Agents {
+		if strings.TrimSpace(def.Device) == deviceID {
+			changed = true
+			continue
+		}
+		kept = append(kept, def)
+	}
+	if !changed {
+		return p.cfg, false
+	}
+	p.cfg.Agents = kept
+	return p.cfg, true
+}
+
+// MergeHostedConfig replaces the pool config with a hosted+local merge while
+// preserving the pool's CURRENT device agents. Device agents are managed
+// exclusively by UpsertDeviceAgents/RemoveDeviceAgents; the hosted refresh's
+// disk snapshot may be arbitrarily stale relative to those mutations, so
+// device entries from the merged snapshot are ignored (manual agents.json
+// edits of device entries take effect after restart).
+func (p *Pool) MergeHostedConfig(cfg Config) Config {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := make([]Definition, 0, len(cfg.Agents)+len(p.cfg.Agents))
+	for _, def := range cfg.Agents {
+		if strings.TrimSpace(def.Device) != "" {
+			continue
+		}
+		kept = append(kept, def)
+	}
+	for _, def := range p.cfg.Agents {
+		if strings.TrimSpace(def.Device) == "" {
+			continue
+		}
+		kept = append(kept, def)
+	}
+	cfg.Agents = kept
 	cfg = p.applyRuntimeEnvOverridesLocked(cfg)
 	p.cfg = cfg
 	return p.cfg

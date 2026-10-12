@@ -13,6 +13,11 @@ import { filterAgentModels } from "./modelFiltering";
 import { openExternalURL } from "../services/platformNavigation";
 import { useI18n } from "../i18n";
 
+type AgentSelectorDeviceOption = {
+  id: string;
+  label: string;
+};
+
 type AgentSelectorProps = {
   agent: string;
   model?: string;
@@ -20,6 +25,12 @@ type AgentSelectorProps = {
   effort?: string;
   fastService?: "" | "on" | "off";
   agents: AgentStatus[];
+  /**
+   * 多设备 CLI 聚合: remote device chips shown as the leftmost column of the
+   * menu. Only enabled devices should be passed; the 本机 chip is rendered
+   * automatically. Omit (or pass empty) to keep the legacy single-column menu.
+   */
+  devices?: AgentSelectorDeviceOption[];
   onAgentChange: (agent: string, model?: string) => void;
   onModeChange?: (mode?: string) => void;
   onEffortChange?: (effort?: string) => void;
@@ -151,6 +162,7 @@ export function AgentSelector({
   effort = "",
   fastService = "",
   agents,
+  devices,
   onAgentChange,
   onModeChange,
   onEffortChange,
@@ -293,6 +305,32 @@ export function AgentSelector({
     return undefined;
   }, [agents, agent, model, t, warnUnavailable]);
 
+  // 多设备 CLI 聚合: the device column derives its selection from the current
+  // agent's device marker, so the column can never drift out of sync with the
+  // selected agent. "" means 本机 (agents without a device field).
+  const deviceColumnDevices = useMemo(
+    () => (devices && devices.length > 0 ? devices : null),
+    [devices],
+  );
+  const deviceAgentCount = useCallback(
+    (deviceId: string) =>
+      agents.filter((item) => String(item.device ?? "") === deviceId).length,
+    [agents],
+  );
+  const selectedDeviceId = useMemo(() => {
+    if (!deviceColumnDevices) {
+      return "";
+    }
+    const current = agents.find((item) => item.name === agent);
+    return String(current?.device ?? "");
+  }, [deviceColumnDevices, agents, agent]);
+  const visibleAgents = useMemo(() => {
+    if (!deviceColumnDevices) {
+      return agents;
+    }
+    return agents.filter((item) => String(item.device ?? "") === selectedDeviceId);
+  }, [deviceColumnDevices, agents, selectedDeviceId]);
+
   useEffect(() => {
     const handlePointerOutside = (e: PointerEvent) => {
       if (
@@ -331,7 +369,7 @@ export function AgentSelector({
         Math.max(node.scrollHeight, AGENT_MENU_MIN_BODY_HEIGHT),
       ),
     );
-  }, [isOpen, submenuAgent, agents.length]);
+  }, [isOpen, submenuAgent, visibleAgents.length]);
 
   useLayoutEffect(() => {
     if (!isOpen || !menuRef.current) {
@@ -420,6 +458,23 @@ export function AgentSelector({
       );
     },
     [allowDefaultModel, handleAgentSelect],
+  );
+
+  // 多设备 CLI 聚合: switching device picks the best agent owned by that
+  // device (first available wins). Rows with no agents are inert (dimmed).
+  const handleDeviceSelect = useCallback(
+    (deviceId: string) => {
+      if (!deviceColumnDevices) {
+        return;
+      }
+      const candidates = agents.filter((item) => String(item.device ?? "") === deviceId);
+      if (candidates.length === 0) {
+        return;
+      }
+      const target = candidates.find((item) => item.available) || candidates[0];
+      handleAgentRowClick(target);
+    },
+    [deviceColumnDevices, agents, handleAgentRowClick],
   );
 
   const handleSubmenuToggle = useCallback((entry: AgentStatus) => {
@@ -627,6 +682,48 @@ export function AgentSelector({
                 : `translateX(${menuHorizontalOffset}px)`,
             }}
           >
+          {deviceColumnDevices ? (
+            <div
+              style={{
+                width: "fit-content",
+                minWidth: "0",
+                maxWidth: "min(36vw, 132px)",
+                borderRight: "1px solid var(--menu-divider)",
+                height: menuBodyHeight ? `${menuBodyHeight}px` : "auto",
+                maxHeight: `${AGENT_MENU_MAX_BODY_HEIGHT}px`,
+                overflowY: "auto",
+                boxSizing: "border-box",
+              }}
+            >
+              <div
+                style={{
+                  padding: "6px 12px",
+                  fontSize: "11px",
+                  fontWeight: 600,
+                  color: "var(--text-secondary)",
+                  textTransform: "uppercase",
+                }}
+              >
+                {t("agent.deviceColumn")}
+              </div>
+              <DeviceMenuRow
+                key="__local__"
+                label={t("device.local")}
+                selected={selectedDeviceId === ""}
+                disabled={deviceAgentCount("") === 0}
+                onClick={() => handleDeviceSelect("")}
+              />
+              {deviceColumnDevices.map((device) => (
+                <DeviceMenuRow
+                  key={device.id}
+                  label={device.label}
+                  selected={selectedDeviceId === device.id}
+                  disabled={deviceAgentCount(device.id) === 0}
+                  onClick={() => handleDeviceSelect(device.id)}
+                />
+              ))}
+            </div>
+          ) : null}
           <div
             ref={agentColumnRef}
             style={{
@@ -635,7 +732,9 @@ export function AgentSelector({
               maxWidth:
                 submenuAgentStatus || errorAgentStatus
                   ? "min(44vw, 180px)"
-                  : "min(72vw, 180px)",
+                  : deviceColumnDevices
+                    ? "min(48vw, 200px)"
+                    : "min(72vw, 180px)",
               height: menuBodyHeight ? `${menuBodyHeight}px` : "auto",
               maxHeight: `${AGENT_MENU_MAX_BODY_HEIGHT}px`,
               overflowY: "auto",
@@ -652,7 +751,7 @@ export function AgentSelector({
             >
               Agent
             </div>
-            {agents.map((a) => {
+            {visibleAgents.map((a) => {
               const hasModelOptions = hasAgentOptions(a);
               const hasError = !a.available && !!a.error;
               const isSelected = a.name === agent;
@@ -1212,6 +1311,69 @@ export function AgentSelector({
         </AgentMenuPortal>
       )}
     </div>
+  );
+}
+
+function DeviceMenuRow({
+  label,
+  selected,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  selected: boolean;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={disabled ? undefined : label}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        width: "100%",
+        minWidth: 0,
+        padding: "9px 12px",
+        border: "none",
+        background: selected ? "rgba(59, 130, 246, 0.08)" : "transparent",
+        color: selected ? "#3b82f6" : "var(--text-primary)",
+        textAlign: "left",
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.45 : 1,
+      }}
+    >
+      <svg
+        width="13"
+        height="13"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+        style={{ flexShrink: 0 }}
+      >
+        <rect x="2" y="4" width="20" height="13" rx="2" />
+        <path d="M8 21h8" />
+        <path d="M12 17v4" />
+      </svg>
+      <span
+        style={{
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          fontSize: "13px",
+          fontWeight: selected ? 500 : 400,
+          whiteSpace: "nowrap",
+        }}
+      >
+        {label}
+      </span>
+    </button>
   );
 }
 

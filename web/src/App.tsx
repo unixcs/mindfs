@@ -48,6 +48,12 @@ import {
   type TokenStationInfo,
 } from "./services/tokenStation";
 import { syncAgentAPIProviders } from "./services/agentConfig";
+import {
+  deviceDisplayName,
+  fetchDevices,
+  invalidateDeviceCache,
+  type Device,
+} from "./services/devices";
 import { syncNativeReplyPollerE2EE } from "./services/replyPoller";
 import {
   ProtectedAPIError,
@@ -226,6 +232,8 @@ const CHILD_SESSION_PAGE_SIZE = 100;
 const MULTI_PROJECT_SESSION_LIMIT = 6;
 const SESSION_PAGE_SIZE = 50;
 const MULTI_PROJECT_SESSION_STORAGE_KEY = "mindfs-multi-project-session-list";
+// 多设备视图开关（文件树分组/会话设备筛选/Agent 设备列的总开关），默认单设备
+const MULTI_DEVICE_VIEW_STORAGE_KEY = "mindfs-device-view";
 const APP_DOCUMENT_TITLE = "MindFS";
 
 function formatDocumentTitle(relayStatus: RelayStatusPayload | null): string {
@@ -421,6 +429,9 @@ type MultiProjectSessionGroup = {
   latestSessionTime: string;
   sessions: SessionItem[];
   totalCount: number;
+  /** Owning remote device id; empty for local roots. */
+  device?: string;
+  deviceLabel?: string;
 };
 
 type SlashCommandResult = {
@@ -687,6 +698,8 @@ type ManagedRootPayload = {
   is_git_worktree?: boolean;
   size?: number;
   mtime?: string;
+  /** Owning remote device id; empty/undefined for local roots. */
+  device?: string;
 };
 type LocalDirItemPayload = {
   name?: string;
@@ -1278,6 +1291,7 @@ function mapManagedRootsToEntries(dirs: ManagedRootPayload[]): FileEntry[] {
     is_root: true,
     size: typeof dir.size === "number" ? dir.size : undefined,
     mtime: typeof dir.mtime === "string" ? dir.mtime : undefined,
+    device: dir.device || undefined,
   }));
 }
 
@@ -1608,6 +1622,15 @@ export function App({ onGoHome }: AppProps) {
     if (typeof window === "undefined") return false;
     return window.localStorage.getItem(MULTI_PROJECT_SESSION_STORAGE_KEY) === "1";
   });
+  const [multiDeviceViewEnabled, setMultiDeviceViewEnabled] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(MULTI_DEVICE_VIEW_STORAGE_KEY) === "1";
+  });
+  // 多设备视图隐含分组会话列表：设备筛选 chips 只存在于分组列表，单列表
+  // 无法展示其他设备的会话。原始设置仍由 multiProjectSessionsEnabled 持久化。
+  const sessionListGrouped = multiProjectSessionsEnabled || multiDeviceViewEnabled;
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [devicesVersion, setDevicesVersion] = useState(0);
   const [multiProjectSessionGroups, setMultiProjectSessionGroups] = useState<MultiProjectSessionGroup[]>([]);
   const [multiProjectSessionsLoading, setMultiProjectSessionsLoading] = useState(false);
   const [multiProjectPendingByKey, setMultiProjectPendingByKey] = useState<Record<string, boolean>>({});
@@ -2802,6 +2825,22 @@ export function App({ onGoHome }: AppProps) {
       cancelled = true;
     };
   }, [agentsVersion, e2eeState.configured, e2eeState.required, e2eeState.unlocked]);
+  // 远程设备列表：与 agents 同一个 e2ee guard，devicesVersion 递增时强制刷新
+  useEffect(() => {
+    let cancelled = false;
+    if (!e2eeState.configured || (e2eeState.required && !e2eeState.unlocked)) {
+      return;
+    }
+    fetchDevices(devicesVersion > 0)
+      .then((items) => {
+        if (cancelled) return;
+        setDevices(items);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [devicesVersion, e2eeState.configured, e2eeState.required, e2eeState.unlocked]);
   useEffect(() => {
     if (!importMenuOpen) return;
     const handlePointerDown = (event: MouseEvent) => {
@@ -2885,6 +2924,12 @@ export function App({ onGoHome }: AppProps) {
       multiProjectSessionsEnabled ? "1" : "0",
     );
   }, [multiProjectSessionsEnabled]);
+  useEffect(() => {
+    window.localStorage.setItem(
+      MULTI_DEVICE_VIEW_STORAGE_KEY,
+      multiDeviceViewEnabled ? "1" : "0",
+    );
+  }, [multiDeviceViewEnabled]);
   useEffect(() => {
     sessionListModeRef.current = sessionListMode;
     if (sessionListMode !== "local") {
@@ -5070,7 +5115,7 @@ export function App({ onGoHome }: AppProps) {
   );
 
   const loadMultiProjectSessionGroups = useCallback(async () => {
-    if (!multiProjectSessionsEnabled || !protectedAPIReady()) {
+    if (!sessionListGrouped || !protectedAPIReady()) {
       return;
     }
     setMultiProjectSessionsLoading(true);
@@ -5083,6 +5128,8 @@ export function App({ onGoHome }: AppProps) {
               rootId: group.rootId,
               rootName: group.rootName || managedRootByIdRef.current[group.rootId]?.display_name || group.rootId,
               latestSessionTime: group.latestSessionTime,
+              device: group.device,
+              deviceLabel: group.device_label,
               sessions: applyPinnedSnapshotToSessions(
                 mergeSessionItems(
                   [],
@@ -5104,6 +5151,8 @@ export function App({ onGoHome }: AppProps) {
         rootId: group.rootId,
         rootName: group.rootName || managedRootByIdRef.current[group.rootId]?.display_name || group.rootId,
         latestSessionTime: group.latestSessionTime,
+        device: group.device,
+        deviceLabel: group.device_label,
         sessions: applyPinnedSnapshotToSessions(
           mergeSessionItems(
             [],
@@ -5124,7 +5173,7 @@ export function App({ onGoHome }: AppProps) {
     } finally {
       setMultiProjectSessionsLoading(false);
     }
-  }, [applyPendingToMultiProjectGroups, multiProjectSessionsEnabled]);
+  }, [applyPendingToMultiProjectGroups, multiProjectSessionsEnabled, multiDeviceViewEnabled]);
 
   const loadMoreMultiProjectSessions = useCallback(
     async (group: ProjectSessionGroup) => {
@@ -5189,12 +5238,12 @@ export function App({ onGoHome }: AppProps) {
   }, [applyPendingToMultiProjectGroups, rootSessionKey]);
 
   useEffect(() => {
-    if (!multiProjectSessionsEnabled) {
+    if (!sessionListGrouped) {
       return;
     }
     void refreshMultiProjectReplyingSessions();
     void loadMultiProjectSessionGroups();
-  }, [loadMultiProjectSessionGroups, multiProjectSessionsEnabled, refreshMultiProjectReplyingSessions]);
+  }, [loadMultiProjectSessionGroups, multiProjectSessionsEnabled, multiDeviceViewEnabled, refreshMultiProjectReplyingSessions]);
 
   const executeSessionSearch = useCallback(() => {
     const trimmed = sessionSearchQuery.trim();
@@ -5217,7 +5266,7 @@ export function App({ onGoHome }: AppProps) {
     }
 
     let cancelled = false;
-    const searchAcrossRoots = multiProjectSessionsEnabled;
+    const searchAcrossRoots = sessionListGrouped;
     setSessionSearchLoading(true);
     void sessionService
       .searchSessions(currentRootId, sessionSearchAppliedQuery, 20, {
@@ -5258,7 +5307,7 @@ export function App({ onGoHome }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [currentRootId, multiProjectSessionsEnabled, sessionListMode, sessionSearchAppliedQuery, sessionSearchOpen]);
+  }, [currentRootId, multiProjectSessionsEnabled, multiDeviceViewEnabled, sessionListMode, sessionSearchAppliedQuery, sessionSearchOpen]);
 
   const openGitDiff = useCallback(
     async (rootID: string, item: GitStatusItem, options?: { preserveRelatedSelection?: boolean; repoPath?: string }) => {
@@ -7715,7 +7764,7 @@ export function App({ onGoHome }: AppProps) {
       }
     }
     managedRootByIdRef.current = nextRootById;
-    if (clearedRootScopedState && multiProjectSessionsEnabled) {
+    if (clearedRootScopedState && sessionListGrouped) {
       void refreshMultiProjectReplyingSessions();
       void loadMultiProjectSessionGroups();
     }
@@ -7775,6 +7824,57 @@ export function App({ onGoHome }: AppProps) {
     refreshMultiProjectReplyingSessions,
     replaceURLState,
   ]);
+
+  // 把远程设备扫描出的目录注册为受管根：走设备专用端点（本机 os.Stat 远程路径必然
+  // 失败，POST /api/dirs 不适用于设备根）；后端先 SSH 确认目录存在再注册
+  const handleAddDeviceRoot = useCallback(
+    async (device: Device, path: string) => {
+      const trimmed = String(path || "").trim();
+      if (!trimmed) {
+        throw new Error(t("devices.rootAddFailed"));
+      }
+      await apiProtectedJSON<ManagedRootPayload>(appPath(`/api/devices/${encodeURIComponent(device.id)}/roots`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: trimmed }),
+      });
+      await refreshManagedRoots();
+      invalidateDeviceCache();
+      setDevicesVersion((version) => version + 1);
+    },
+    [refreshManagedRoots, t],
+  );
+
+  // 设备卡片增删改/同步/测试供给完成后：刷新设备列表 + 代理列表（新设备可能自动建了代理）
+  const handleDevicesChanged = useCallback(() => {
+    invalidateDeviceCache();
+    setDevicesVersion((version) => version + 1);
+    setAgentsVersion((version) => version + 1);
+    // Device test/sync can import mirrored sessions; refresh the grouped
+    // session list so they appear without a manual reload.
+    if (sessionListGrouped) {
+      void loadMultiProjectSessionGroups();
+    }
+  }, [multiProjectSessionsEnabled, multiDeviceViewEnabled, loadMultiProjectSessionGroups]);
+
+  // 每台设备名下的代理数（供设备卡删除确认展示清理规模）；本机代理不计入
+  const agentCountByDevice = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const agent of availableAgents) {
+      const device = String(agent.device || "").trim();
+      if (!device) {
+        continue;
+      }
+      counts[device] = (counts[device] || 0) + 1;
+    }
+    return counts;
+  }, [availableAgents]);
+  const enabledDevices = useMemo(() => devices.filter((device) => device.enabled), [devices]);
+  // AgentSelector 设备列的候选（仅启用设备）；FileTree/设置区用的是完整 Device 对象
+  const agentSelectorDevices = useMemo(
+    () => enabledDevices.map((device) => ({ id: device.id, label: deviceDisplayName(device) })),
+    [enabledDevices],
+  );
 
   const applyManagedRootRename = useCallback(
     (oldRootID: string, rootPayload: ManagedRootPayload | null | undefined) => {
@@ -9880,7 +9980,7 @@ export function App({ onGoHome }: AppProps) {
               newest ? { afterTime: newest } : { replace: true },
             );
           }
-          if (multiProjectSessionsEnabled) {
+          if (sessionListGrouped) {
             void refreshMultiProjectReplyingSessions();
             void loadMultiProjectSessionGroups();
           }
@@ -9899,7 +9999,7 @@ export function App({ onGoHome }: AppProps) {
               newest ? { afterTime: newest } : { replace: true },
             );
           }
-          if (multiProjectSessionsEnabled) {
+          if (sessionListGrouped) {
             void refreshMultiProjectReplyingSessions();
             void loadMultiProjectSessionGroups();
           }
@@ -9979,7 +10079,7 @@ export function App({ onGoHome }: AppProps) {
               }
             }
           }
-          if (multiProjectSessionsEnabled) {
+          if (sessionListGrouped) {
             void loadMultiProjectSessionGroups();
           }
           break;
@@ -9990,7 +10090,7 @@ export function App({ onGoHome }: AppProps) {
           if (rootID && rootID === currentRootIdRef.current) {
             void loadSessionsForRoot(rootID, { replace: true });
           }
-          if (rootID && multiProjectSessionsEnabled) {
+          if (rootID && sessionListGrouped) {
             void loadMultiProjectSessionGroups();
           }
           break;
@@ -10181,7 +10281,7 @@ export function App({ onGoHome }: AppProps) {
               rootID,
               newest ? { afterTime: newest } : { replace: true },
             );
-            if (multiProjectSessionsEnabled) {
+            if (sessionListGrouped) {
               void loadMultiProjectSessionGroups();
             }
           } else if (currentRootIdRef.current) {
@@ -10190,7 +10290,7 @@ export function App({ onGoHome }: AppProps) {
               currentRootIdRef.current,
               newest ? { afterTime: newest } : { replace: true },
             );
-            if (multiProjectSessionsEnabled) {
+            if (sessionListGrouped) {
               void refreshMultiProjectReplyingSessions();
               void loadMultiProjectSessionGroups();
             }
@@ -10340,7 +10440,7 @@ export function App({ onGoHome }: AppProps) {
               rootID,
               newest ? { afterTime: newest } : { replace: true },
             );
-            if (multiProjectSessionsEnabled) {
+            if (sessionListGrouped) {
               void loadMultiProjectSessionGroups();
             }
           }
@@ -10555,7 +10655,7 @@ export function App({ onGoHome }: AppProps) {
               rootID,
               newest ? { afterTime: newest } : { replace: true },
             );
-            if (multiProjectSessionsEnabled) {
+            if (sessionListGrouped) {
               void loadMultiProjectSessionGroups();
             }
           }
@@ -10650,6 +10750,7 @@ export function App({ onGoHome }: AppProps) {
     loadMultiProjectSessionGroups,
     loadSessionsForRoot,
     multiProjectSessionsEnabled,
+    multiDeviceViewEnabled,
     refreshMultiProjectReplyingSessions,
     rootSessionKey,
     resolveRootForSessionKey,
@@ -10875,7 +10976,7 @@ export function App({ onGoHome }: AppProps) {
     setAgentsVersion((v) => v + 1);
     void loadTaskTemplates();
     void loadKanbanTasks(currentRootIdRef.current);
-    if (multiProjectSessionsEnabled) {
+    if (sessionListGrouped) {
       void loadMultiProjectSessionGroups();
     }
   }, [
@@ -10884,6 +10985,7 @@ export function App({ onGoHome }: AppProps) {
     loadMultiProjectSessionGroups,
     loadTaskTemplates,
     multiProjectSessionsEnabled,
+    multiDeviceViewEnabled,
   ]);
 
   const describeE2EEPromptError = useCallback((err: unknown) => {
@@ -13769,6 +13871,7 @@ export function App({ onGoHome }: AppProps) {
           <FileViewer
             file={file}
             rootPath={managedRootByIdRef.current[file?.root || ""]?.root_path}
+            rootIsDevice={!!managedRootByIdRef.current[file?.root || ""]?.device}
             onFileOperationComplete={async () => {
               if (!file?.root) return;
               const parent = file.path.split("/").slice(0, -1).join("/") || ".";
@@ -14265,7 +14368,7 @@ export function App({ onGoHome }: AppProps) {
           void handleLoadOlderExternalSessions();
         }}
       />
-    ) : multiProjectSessionsEnabled && !sessionSearchOpen && !sessionSearchResultsMode ? (
+    ) : sessionListGrouped && !sessionSearchOpen && !sessionSearchResultsMode ? (
       <MultiProjectSessionList
         groups={multiProjectSessionGroups}
         selectedKey={selectedSession?.key}
@@ -14305,6 +14408,7 @@ export function App({ onGoHome }: AppProps) {
         onHandoffPack={handleHandoffPack}
         filter={sessionFilter}
         onFilterChange={handleSessionFilterChange}
+        multiDeviceViewEnabled={multiDeviceViewEnabled}
       />
     ) : (
       <SessionList
@@ -14677,6 +14781,12 @@ export function App({ onGoHome }: AppProps) {
             onRunAgentLifecycleCommand={handleRunAgentLifecycleCommand}
             onRestartAgent={handleRestartAgent}
             onGoHome={onGoHome}
+            devices={devices}
+            agentCountByDevice={agentCountByDevice}
+            multiDeviceViewEnabled={multiDeviceViewEnabled}
+            onMultiDeviceViewChange={setMultiDeviceViewEnabled}
+            onAddDeviceRoot={handleAddDeviceRoot}
+            onDevicesChanged={handleDevicesChanged}
           />
         }
         rightSidebar={sessionSidebar}
@@ -14805,6 +14915,7 @@ export function App({ onGoHome }: AppProps) {
               taskGroupBadge={actionBarSessionKey ? <TaskGroupPanel key={`${actionBarSession?.root_id || currentRootId}:${actionBarSessionKey}`} rootId={actionBarSession?.root_id || currentRootId || ""} sessionKey={actionBarSessionKey} renderTask={(detail, close) => renderKanbanTaskCard(detail.task, isTerminalKanbanTask(detail.task) ? t("task.column.done") : t("task.column.running"), detail, true, close)} /> : null}
               status={status}
               agentsVersion={agentsVersion}
+              devices={agentSelectorDevices}
               codexRateLimitsRefreshToken={codexRateLimitsRefreshToken}
               currentRootId={currentRootId}
               currentRootIsGitRepo={managedRootByIdRef.current[currentRootId || ""]?.is_git_repo === true}

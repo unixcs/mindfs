@@ -91,6 +91,15 @@ func (s *Service) PrepareEditedSession(ctx context.Context, in EditSessionMessag
 	if err != nil {
 		return nil, target, err
 	}
+	// Mirrored device sessions record the remote CLI's local agent name;
+	// remap it to this device's provisioned agent (and drop models the device
+	// agent does not list) before opening a runtime session, otherwise a
+	// local agent would spawn with the remote path string as cwd — hitting a
+	// same-named directory on THIS machine when one exists.
+	agentName, target.Model = s.resolveDeviceAgentForRoot(root, agentName, target.Model)
+	if err := s.validateAgentForRoot(root, agentName); err != nil {
+		return nil, target, err
+	}
 	var nextBinding *session.AgentBinding
 	runtimeRoot := root.RootPath
 	if current.RelatedWorktree != nil && current.RelatedWorktree.Path != "" {
@@ -99,6 +108,13 @@ func (s *Service) PrepareEditedSession(ctx context.Context, in EditSessionMessag
 	// Native agents retain the preceding completed turn. With no preceding
 	// turn, sending starts fresh; ACP recovers context from the retained log.
 	if !isACPAgent(pool, agentName) {
+		if strings.TrimSpace(root.Device) != "" {
+			// Non-ACP edits rebuild CLI context from a fork point resolved
+			// against the LOCAL CLI's session store; a device root's sessions
+			// live on the remote machine, so the rewrite would fail obscurely
+			// (same boundary as ForkSession's explicit refusal).
+			return nil, target, errors.New("设备根上的 codex/claude 会话暂不支持编辑重写（远端 CLI 上下文无法在面板侧重建）")
+		}
 		previousSeq := 0
 		for _, e := range current.Exchanges {
 			if e.Seq < target.Seq && isAgentExchangeRole(e.Role) && (e.Agent == agentName || e.Agent == "") {

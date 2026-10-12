@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"mindfs/internal/remote"
 	"mindfs/server/app"
 )
 
@@ -38,6 +39,11 @@ const (
 )
 
 func main() {
+	// __remote-agent shim: re-exec the agent command line over SSH. Must run
+	// before flag parsing; the marker argv arrives from the agent pool wrap.
+	if len(os.Args) > 1 && remote.IsShimArgv(os.Args[1:]) {
+		os.Exit(remote.RunShim(os.Args[1:]))
+	}
 	autoStartBoot := autoStartRequested(os.Args[1:])
 	if autoStartBoot {
 		if err := prepareAutoStartEnvironment(); err != nil {

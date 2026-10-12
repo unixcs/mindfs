@@ -285,6 +285,9 @@ export type MultiRootSessionGroup = {
   pinnedItems: Session[];
   pinnedKeys: string[];
   totalCount: number;
+  /** Owning remote device id; empty/undefined for local roots. */
+  device?: string;
+  device_label?: string;
 };
 
 export type FetchExternalSessionsOptions = {
@@ -1227,6 +1230,8 @@ class SessionService {
             ? group.pinned_items.map((item: any) => String(item?.key || item?.session_key || "")).filter(Boolean)
             : [],
         totalCount: Number(group?.total_count ?? group?.totalCount ?? 0) || 0,
+        device: typeof group?.device === "string" && group.device.trim() ? group.device.trim() : undefined,
+        device_label: typeof group?.device_label === "string" && group.device_label.trim() ? group.device_label.trim() : undefined,
       })).filter((group: MultiRootSessionGroup) => !!group.rootId);
     } catch (err) {
       if (err instanceof Error && err.message === "api_not_ready") {

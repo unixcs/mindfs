@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"mindfs/internal/remote"
 	"mindfs/server/internal/agent"
 	agenttypes "mindfs/server/internal/agent/types"
 	"mindfs/server/internal/commandexec"
@@ -64,6 +65,10 @@ type SessionRootGroup struct {
 	PinnedSessions    []*session.Session
 	PinnedKeys        []string
 	TotalCount        int
+	// Device identifies the remote device this root belongs to (empty for
+	// local roots). DeviceLabel is the display name shown by the UI.
+	Device      string `json:"device,omitempty"`
+	DeviceLabel string `json:"device_label,omitempty"`
 }
 
 type ListMultiRootSessionsOutput struct {
@@ -158,6 +163,14 @@ func (s *Service) ListMultiRootSessions(ctx context.Context, in ListMultiRootSes
 	if limit <= 0 {
 		limit = 6
 	}
+	// Device roots carry their owning device id (fs.RootInfo.Device); the UI
+	// gets the display label so per-machine grouping needs no extra lookups.
+	deviceLabels := map[string]string{}
+	if runtime, ok := s.Registry.GetDeviceRuntime(); ok && runtime.Store != nil {
+		for _, device := range runtime.Store.List() {
+			deviceLabels[device.ID] = device.DisplayName()
+		}
+	}
 	groups := make([]SessionRootGroup, 0)
 	for _, root := range s.Registry.ListRoots() {
 		manager, err := s.Registry.GetSessionManager(root.ID)
@@ -192,7 +205,7 @@ func (s *Service) ListMultiRootSessions(ctx context.Context, in ListMultiRootSes
 		if len(items) > 0 && items[0] != nil {
 			latest = items[0].UpdatedAt
 		}
-		groups = append(groups, SessionRootGroup{
+		group := SessionRootGroup{
 			RootID:            root.ID,
 			RootName:          root.Name,
 			LatestSessionTime: latest,
@@ -200,7 +213,18 @@ func (s *Service) ListMultiRootSessions(ctx context.Context, in ListMultiRootSes
 			PinnedSessions:    pinnedItems,
 			PinnedKeys:        pinnedKeys,
 			TotalCount:        totalCount,
-		})
+		}
+		if root.Device != "" {
+			group.Device = root.Device
+			if label, ok := deviceLabels[root.Device]; ok && label != "" {
+				group.DeviceLabel = label
+			} else {
+				// Label unknown (e.g. device deleted while roots remain) —
+				// fall back to the raw device id.
+				group.DeviceLabel = root.Device
+			}
+		}
+		groups = append(groups, group)
 	}
 	sort.SliceStable(groups, func(i, j int) bool {
 		return groups[i].LatestSessionTime.After(groups[j].LatestSessionTime)
@@ -451,18 +475,39 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 	if agentName == "" {
 		return ForkSessionOutput{}, errors.New("agent not found for fork target")
 	}
-	binding, err := manager.FindAgentBinding(ctx, current.Key, agentName)
-	if err != nil {
+	// The forked runtime session must belong to the root's device: remap a
+	// mirrored session's original agent name to the provisioned device agent
+	// before anything spawns with the remote path string as cwd.
+	runtimeAgent, runtimeModel := s.resolveDeviceAgentForRoot(root, agentName, resolveForkModel(current, target))
+	if err := s.validateAgentForRoot(root, runtimeAgent); err != nil {
 		return ForkSessionOutput{}, err
-	}
-	if binding == nil || strings.TrimSpace(binding.AgentSessionID) == "" {
-		return ForkSessionOutput{}, errors.New("agent session binding not found")
 	}
 	pool := s.Registry.GetAgentPool()
 	if pool == nil {
 		return ForkSessionOutput{}, errors.New("agent pool not configured")
 	}
-	isACP := isACPAgent(pool, agentName)
+	isACP := isACPAgent(pool, runtimeAgent)
+	if !isACP && strings.TrimSpace(root.Device) != "" {
+		// Non-ACP forks rebuild CLI context from a fork point resolved against
+		// the LOCAL CLI's session store; a device root's sessions live on the
+		// remote machine, so the fork would silently start without context.
+		return ForkSessionOutput{}, errors.New("设备根上的 codex/claude 会话暂不支持派生（远端 CLI 上下文无法在面板侧重建）")
+	}
+	binding, err := manager.FindAgentBinding(ctx, current.Key, agentName)
+	if err != nil {
+		return ForkSessionOutput{}, err
+	}
+	if binding == nil && runtimeAgent != agentName {
+		// Mirrored sessions store their agent bindings under the mapped
+		// device agent name while the session row keeps the original name.
+		binding, err = manager.FindAgentBinding(ctx, current.Key, runtimeAgent)
+		if err != nil {
+			return ForkSessionOutput{}, err
+		}
+	}
+	if binding == nil || strings.TrimSpace(binding.AgentSessionID) == "" {
+		return ForkSessionOutput{}, errors.New("agent session binding not found")
+	}
 	var forkPoint agenttypes.ResolveForkPointOutput
 	if !isACP {
 		importer, err := s.resolveExternalSessionImporter(agentName)
@@ -496,8 +541,8 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		Type:             session.TypeChat,
 		ParentSessionKey: current.Key,
 		Source:           string(sourceJSON),
-		Agent:            agentName,
-		Model:            resolveForkModel(current, target),
+		Agent:            runtimeAgent,
+		Model:            runtimeModel,
 		Name:             buildForkSessionName(current, target.Seq),
 		PlanMode:         current.PlanMode,
 	})
@@ -518,9 +563,9 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		agentCtxSeq = 0
 	}
 	sess, err := pool.GetOrCreate(openCtx, agenttypes.OpenSessionInput{
-		SessionKey:     agentPoolSessionKey(created.Key, agentName),
-		AgentName:      agentName,
-		Model:          resolveForkModel(current, target),
+		SessionKey:     agentPoolSessionKey(created.Key, runtimeAgent),
+		AgentName:      runtimeAgent,
+		Model:          runtimeModel,
 		Mode:           strings.TrimSpace(target.Mode),
 		Effort:         strings.TrimSpace(target.Effort),
 		FastService:    strings.TrimSpace(target.FastService),
@@ -544,7 +589,9 @@ func (s *Service) ForkSession(ctx context.Context, in ForkSessionInput) (ForkSes
 		_ = manager.Delete(ctx, created.Key)
 		return ForkSessionOutput{}, err
 	}
-	if err := manager.UpdateAgentState(ctx, latest, agentName, agentCtxSeq, agentSessionID); err != nil {
+	// The binding must land under the name SendMessage will later resolve
+	// (the remapped runtime agent, same key as the pool session above).
+	if err := manager.UpdateAgentState(ctx, latest, runtimeAgent, agentCtxSeq, agentSessionID); err != nil {
 		_ = manager.Delete(ctx, created.Key)
 		return ForkSessionOutput{}, err
 	}
@@ -712,10 +759,248 @@ func (s *Service) GetSession(ctx context.Context, in GetSessionInput) (*session.
 		return nil, err
 	}
 	current, err := manager.Get(ctx, in.Key, in.Seq)
+	// Lazy mirror pull: a mirrored (device) session whose local exchange log
+	// is missing gets one chance to fetch its log from the device before the
+	// (possibly empty) result is returned.
+	if err == nil && in.Seq <= 0 && s.tryPullDeviceSessionLog(ctx, in.RootID, manager, current) {
+		current, err = manager.Get(ctx, in.Key, in.Seq)
+	}
 	if err == nil && in.Seq > 0 && current.HistoryRevision != in.HistoryRevision {
 		return manager.Get(ctx, in.Key, 0)
 	}
 	return current, err
+}
+
+// deviceSessionPullTimeout bounds one lazy single-session mirror pull.
+const deviceSessionPullTimeout = 8 * time.Second
+
+// devicePullFailureTTL: after a failed lazy pull for a (device, session) pair,
+// retries are short-circuited for this long so an offline device does not cost
+// every session open/send an 8s SSH round trip.
+const devicePullFailureTTL = 90 * time.Second
+
+type devicePullFailureKey struct {
+	deviceID string
+	key      string
+}
+
+var (
+	devicePullFailuresMu sync.Mutex
+	devicePullFailures   = map[devicePullFailureKey]time.Time{}
+	// devicePullInflight dedupes concurrent pulls for the same (device,
+	// session): the second waiter just re-reads the local log instead of
+	// issuing a second SSH round trip.
+	devicePullInflight = map[devicePullFailureKey]*sync.WaitGroup{}
+)
+
+func devicePullRecentlyFailed(deviceID, key string) bool {
+	devicePullFailuresMu.Lock()
+	defer devicePullFailuresMu.Unlock()
+	until, ok := devicePullFailures[devicePullFailureKey{deviceID, key}]
+	return ok && time.Now().Before(until)
+}
+
+func devicePullMarkFailed(deviceID, key string) {
+	devicePullFailuresMu.Lock()
+	defer devicePullFailuresMu.Unlock()
+	devicePullFailures[devicePullFailureKey{deviceID, key}] = time.Now().Add(devicePullFailureTTL)
+	if len(devicePullFailures) > 4096 {
+		now := time.Now()
+		for k, until := range devicePullFailures {
+			if now.After(until) {
+				delete(devicePullFailures, k)
+			}
+		}
+	}
+}
+
+// tryPullDeviceSessionLog lazily fetches a mirrored session's exchange log
+// from its device when the local log is missing (e.g. the sync ran before the
+// remote log was flushed, or the mirror listing is stale). It is best-effort:
+// any failure is logged and returns false, never surfaced to the client.
+func (s *Service) tryPullDeviceSessionLog(ctx context.Context, rootID string, manager *session.Manager, current *session.Session) bool {
+	if current == nil || s.Registry == nil {
+		return false
+	}
+	device, ok := s.deviceForRoot(manager.Root())
+	if !ok {
+		return false
+	}
+	if !strings.HasPrefix(current.Source, "remote:"+device.ID) {
+		return false
+	}
+	if manager.ExchangeLogExists(current.Key) {
+		return false
+	}
+	if devicePullRecentlyFailed(device.ID, current.Key) {
+		return false
+	}
+	pullKey := devicePullFailureKey{device.ID, current.Key}
+	devicePullFailuresMu.Lock()
+	wg, busy := devicePullInflight[pullKey]
+	if busy {
+		devicePullFailuresMu.Unlock()
+		wg.Wait() // another goroutine is pulling; fall through to re-check
+		return manager.ExchangeLogExists(current.Key)
+	}
+	wg = &sync.WaitGroup{}
+	wg.Add(1)
+	devicePullInflight[pullKey] = wg
+	devicePullFailuresMu.Unlock()
+	defer func() {
+		devicePullFailuresMu.Lock()
+		delete(devicePullInflight, pullKey)
+		devicePullFailuresMu.Unlock()
+		wg.Done()
+	}()
+
+	runtime, ok := s.Registry.GetDeviceRuntime()
+	if !ok || runtime.Store == nil || strings.TrimSpace(device.MindFSHome) == "" {
+		return false
+	}
+	muxDir, err := remote.MuxDir(runtime.ConfigDir)
+	if err != nil {
+		log.Printf("[session/mirror] lazy pull root=%s session=%s device=%s: mux dir: %v", rootID, current.Key, device.ID, err)
+		return false
+	}
+	pullCtx, cancel := context.WithTimeout(ctx, deviceSessionPullTimeout)
+	defer cancel()
+	fetch := remote.SSHFetcher(device, muxDir, deviceSessionPullTimeout)
+	remoteRoots, err := remote.DiscoverRemoteRoots(pullCtx, fetch, device.MindFSHome)
+	if err != nil {
+		log.Printf("[session/mirror] lazy pull root=%s session=%s device=%s: discover: %v", rootID, current.Key, device.ID, err)
+		devicePullMarkFailed(device.ID, current.Key)
+		return false
+	}
+	remoteRoot, matched := remote.MatchRootByPath(remoteRoots, manager.Root().RootPath)
+	if !matched {
+		log.Printf("[session/mirror] lazy pull root=%s session=%s device=%s: no remote root for path %s", rootID, current.Key, device.ID, manager.Root().RootPath)
+		// No remote root is a stable condition (not a transient outage), but
+		// still cache briefly: retrying per keystroke cannot succeed.
+		devicePullMarkFailed(device.ID, current.Key)
+		return false
+	}
+	payload, err := remote.FetchRemoteSessionLog(pullCtx, fetch, remote.RemoteMetaDirPath(device.MindFSHome, remoteRoot), current.Key)
+	if err != nil {
+		log.Printf("[session/mirror] lazy pull root=%s session=%s device=%s: fetch: %v", rootID, current.Key, device.ID, err)
+		devicePullMarkFailed(device.ID, current.Key)
+		return false
+	}
+	wrote, err := manager.WriteExchangeLogIfMissing(current.Key, payload)
+	if err != nil {
+		log.Printf("[session/mirror] lazy pull root=%s session=%s device=%s: store: %v", rootID, current.Key, device.ID, err)
+		return false
+	}
+	if wrote {
+		log.Printf("[session/mirror] lazy pull root=%s session=%s device=%s: ok (%d bytes)", rootID, current.Key, device.ID, len(payload))
+	}
+	return wrote
+}
+
+// deviceForRoot resolves the device that owns a registered root. Device roots
+// persist their device id in fs.RootInfo.Device (empty = local root).
+func (s *Service) deviceForRoot(root fs.RootInfo) (remote.Device, bool) {
+	deviceID := strings.TrimSpace(root.Device)
+	if deviceID == "" || s.Registry == nil {
+		return remote.Device{}, false
+	}
+	runtime, ok := s.Registry.GetDeviceRuntime()
+	if !ok || runtime.Store == nil {
+		return remote.Device{}, false
+	}
+	return runtime.Store.Get(deviceID)
+}
+
+// rewriteAgentForDeviceRoot maps a mirrored remote session's original agent
+// name ("opencode") to the provisioned device agent ("jp-opencode") when the
+// message targets that device's root. A model id recorded by the remote CLI
+// may not exist in the device agent's probed catalog, so it is dropped and
+// the remote session resumes with its own recorded model.
+func (s *Service) rewriteAgentForDeviceRoot(root fs.RootInfo, in *SendMessageInput) {
+	if in == nil || s.Registry == nil {
+		return
+	}
+	in.Agent, in.Model = s.resolveDeviceAgentForRoot(root, in.Agent, in.Model)
+}
+
+// resolveDeviceAgentForRoot maps a session-recorded agent name (possibly the
+// remote session's original local agent name like "opencode") to the
+// provisioned "<deviceID>-<agent>" agent for the root's device, and drops
+// model ids absent from the device agent's probed catalog. SendMessage and the
+// edit/fork flows both use it — the latter resolve the agent from the session
+// row instead of request input.
+func (s *Service) resolveDeviceAgentForRoot(root fs.RootInfo, agentName, model string) (string, string) {
+	if s.Registry == nil {
+		return agentName, model
+	}
+	device, ok := s.deviceForRoot(root)
+	if !ok {
+		return agentName, model
+	}
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" {
+		return agentName, model
+	}
+	pool := s.Registry.GetAgentPool()
+	if pool == nil {
+		return agentName, model
+	}
+	cfg := pool.Config()
+	if def, exists := cfg.GetAgent(agentName); exists {
+		if def.Device == device.ID || strings.HasPrefix(def.Name, device.ID+"-") {
+			return agentName, model // already a device agent
+		}
+	}
+	deviceAgent := device.ID + "-" + agentName
+	if _, exists := cfg.GetAgent(deviceAgent); !exists {
+		return agentName, model // no provisioned equivalent: validation reports it
+	}
+	agentName = deviceAgent
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return agentName, model
+	}
+	prober := s.Registry.GetProber()
+	if prober == nil {
+		return agentName, model
+	}
+	status, ok := prober.GetStatus(agentName)
+	if !ok || len(status.Models) == 0 {
+		return agentName, model
+	}
+	for _, item := range status.Models {
+		if strings.TrimSpace(item.ID) == model {
+			return agentName, model
+		}
+	}
+	return agentName, ""
+}
+
+// validateAgentForRoot enforces agent×root consistency: on a device root the
+// selected agent must belong to that device (agent.Definition.Device equals
+// the device id, or the agent is one of its provisioned "<deviceID>-*"
+// agents). Unknown agent names are left to the pool's own error reporting.
+func (s *Service) validateAgentForRoot(root fs.RootInfo, agentName string) error {
+	agentName = strings.TrimSpace(agentName)
+	if agentName == "" || s.Registry == nil {
+		return nil
+	}
+	device, ok := s.deviceForRoot(root)
+	if !ok {
+		return nil // local root: no device constraint
+	}
+	pool := s.Registry.GetAgentPool()
+	if pool == nil {
+		return nil
+	}
+	def, exists := pool.Config().GetAgent(agentName)
+	if !exists {
+		return nil
+	}
+	if def.Device == device.ID || strings.HasPrefix(def.Name, device.ID+"-") {
+		return nil
+	}
+	return fmt.Errorf("该 Agent 不属于此设备 (%s)", device.DisplayName())
 }
 
 type GetSessionExchangeAuxInput struct {
@@ -1657,6 +1942,39 @@ func isNonRecoverableAgentError(err error) bool {
 	return false
 }
 
+// isTransportDeadError reports whether err indicates the runtime's transport
+// (stdio pipe / network connection) is gone — e.g. a resumed session whose
+// direct SSH transport dropped while the pool still held the dead handle.
+// Reopening the pool session and resending is safe in that case: the prompt
+// never reached the CLI.
+func isTransportDeadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	value := strings.ToLower(strings.TrimSpace(err.Error()))
+	if value == "" {
+		return false
+	}
+	needles := []string{
+		"broken pipe",
+		"pipe closed",
+		"pipe is closed",
+		"use of closed network connection",
+		"connection reset",
+		"connection refused",
+		"transport closed",
+		"session closed",
+		"already closed",
+		"unexpected eof",
+	}
+	for _, needle := range needles {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func cancelRuntimeAfterNonRecoverableError(sess agenttypes.Session, pool *agent.Pool, agentName string, cause error) {
 	agentName = strings.TrimSpace(agentName)
 	if sess != nil {
@@ -2197,9 +2515,15 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		return err
 	}
 	isInitial := len(current.Exchanges) == 0
+	s.rewriteAgentForDeviceRoot(manager.Root(), &in)
 	agentPool := s.Registry.GetAgentPool()
 	if agentPool == nil {
 		return nil
+	}
+	// Agent×root consistency: a device root only accepts agents that belong
+	// to its device (see validateAgentForRoot).
+	if err := s.validateAgentForRoot(manager.Root(), in.Agent); err != nil {
+		return err
 	}
 	watcher, _ := s.Registry.GetFileWatcher(in.RootID, manager)
 	if watcher != nil {
@@ -2407,7 +2731,7 @@ func (s *Service) SendMessage(ctx context.Context, in SendMessageInput) error {
 		if isNonRecoverableAgentError(sendErr) {
 			log.Printf("[session] turn.send.non_recoverable root=%s session=%s agent=%s action=fail_without_recovery err=%v", in.RootID, current.Key, in.Agent, sendErr)
 			cancelRuntimeAfterNonRecoverableError(sess, agentPool, in.Agent, sendErr)
-		} else if !sawAssistantChunk {
+		} else if !sawAssistantChunk && !isTransportDeadError(sendErr) {
 			log.Printf("[session] turn.send.no_response root=%s session=%s agent=%s action=fail_without_recovery", in.RootID, current.Key, in.Agent)
 		} else {
 			if in.OnUpdate != nil {
@@ -3447,6 +3771,22 @@ type SendRecoveryInput struct {
 	SendWithAttachment func(agenttypes.Session, string) error
 }
 
+// reopenDeadRuntimeSession drops the cached pool session whose transport died
+// and opens a fresh runtime for the same MindFS session. The stored agent
+// binding (AgentSessionID) lets the remote CLI resume its own context.
+func (s *Service) reopenDeadRuntimeSession(ctx context.Context, in SendRecoveryInput) (agenttypes.Session, error) {
+	if s == nil || s.Registry == nil {
+		return nil, errors.New("services not configured")
+	}
+	pool := s.Registry.GetAgentPool()
+	if pool == nil {
+		return nil, errors.New("agent pool unavailable")
+	}
+	pool.Close(agentPoolSessionKey(in.SessionKey, in.AgentName))
+	sess, _, err := s.ensureAgentSession(ctx, pool, in.Manager, in.Current, in.AgentName, in.Model, in.Mode, in.Effort, in.FastService, in.RootAbs, "")
+	return sess, err
+}
+
 func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (agenttypes.Session, error) {
 	if s == nil {
 		return nil, errors.New("services not configured")
@@ -3488,6 +3828,17 @@ func (s *Service) recoverAgentTurn(ctx context.Context, in SendRecoveryInput) (a
 			if isNonRecoverableAgentError(err) {
 				log.Printf("[session/recovery] send.non_recoverable root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)
 				return nil, err
+			}
+			if isTransportDeadError(err) {
+				// The cached runtime's transport died (network blip on a
+				// direct SSH connection). Drop it and open a fresh session
+				// before the next attempt; the binding lets the CLI resume.
+				if reopened, rerr := s.reopenDeadRuntimeSession(ctx, in); rerr == nil {
+					in.CurrentSession = reopened
+					log.Printf("[session/recovery] reopen.ok root=%s session=%s agent=%s attempt=%d/%d", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts)
+				} else {
+					log.Printf("[session/recovery] reopen.failed root=%s session=%s agent=%s attempt=%d/%d err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, rerr)
+				}
 			}
 			lastErr = err
 			log.Printf("[session/recovery] send.failed root=%s session=%s agent=%s attempt=%d/%d action=%s err=%v", in.RootID, in.SessionKey, in.AgentName, attempt, sessionRecoveryAttempts, recoveryAction, err)

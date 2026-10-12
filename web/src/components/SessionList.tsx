@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { AgentIcon } from "./AgentIcon";
 import { ModeIcon } from "./ModeIcon";
+import { DeviceBadge, DeviceFilterChip } from "./DeviceBadge";
 import { rootBadgeButtonStyle, rootBadgeStyle } from "./rootBadgeStyle";
 import { useI18n, type Locale } from "../i18n";
 import { copyText } from "../services/clipboard";
@@ -12,6 +13,22 @@ import {
   type SessionFilterState,
 } from "../services/sessionFilter";
 import { SessionFilterBar } from "./SessionFilterBar";
+
+// 设备筛选 chips 行：移动端横滚、桌面端换行（与 SessionFilterBar 同约定）
+const sessionDeviceBarScopedStyle = `
+  .mindfs-session-device-bar {
+    scrollbar-width: none;
+  }
+  .mindfs-session-device-bar::-webkit-scrollbar {
+    display: none;
+  }
+  @media (min-width: 768px) {
+    .mindfs-session-device-bar {
+      flex-wrap: wrap;
+      overflow-x: visible;
+    }
+  }
+`;
 
 export type SessionType = "chat" | "plugin" | "command";
 
@@ -93,6 +110,9 @@ export type ProjectSessionGroup = {
   latestSessionTime?: string;
   sessions: SessionItem[];
   totalCount: number;
+  /** Owning remote device id; empty/undefined for local roots. */
+  device?: string;
+  deviceLabel?: string;
 };
 
 type ProjectSessionListProps = {
@@ -119,6 +139,8 @@ type ProjectSessionListProps = {
   ) => Promise<{ hasMore?: boolean } | void> | { hasMore?: boolean } | void;
   filter?: SessionFilterState;
   onFilterChange?: (filter: SessionFilterState) => void;
+  /** 多设备模式开关：true 时列表上方显示设备筛选 chips（过滤逻辑在组件内完成）。 */
+  multiDeviceViewEnabled?: boolean;
 };
 
 function ToggleRowButton({
@@ -848,10 +870,14 @@ export function MultiProjectSessionList({
   onHandoffPack,
   filter,
   onFilterChange,
+  multiDeviceViewEnabled = false,
 }: ProjectSessionListProps) {
   const { locale, t } = useI18n();
   const effectiveEmptyText = emptyText || t("sessionList.empty");
   const [expandedProjects, setExpandedProjects] = useState<Record<string, boolean>>({});
+  const [deviceFilter, setDeviceFilter] = useState<string | null>(null);
+  // 关掉多设备模式时忽略残留的设备筛选，避免列表“看起来”空了
+  const activeDeviceFilter = multiDeviceViewEnabled ? deviceFilter : null;
   const [loadingProjects, setLoadingProjects] = useState<Record<string, boolean>>({});
   const [expandedChildren, setExpandedChildren] = useState<Record<string, boolean>>({});
   const [loadingChildren, setLoadingChildren] = useState<Record<string, boolean>>({});
@@ -884,12 +910,39 @@ export function MultiProjectSessionList({
     window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(pinnedProjects));
   }, [pinnedProjects]);
   const filterActive = !!filter && !!onFilterChange && isSessionFilterActive(filter);
+  // 设备筛选 chips 的候选集：从分组自带的 device/deviceLabel 推导（只有存在远程设备分组时才显示）
+  const deviceOptions = useMemo(() => {
+    let hasLocal = false;
+    let hasRemote = false;
+    const remotes: Array<{ id: string; label: string }> = [];
+    const seen = new Set<string>();
+    for (const group of groups) {
+      const device = String(group.device || "");
+      if (!device) {
+        hasLocal = true;
+        continue;
+      }
+      hasRemote = true;
+      if (seen.has(device)) {
+        continue;
+      }
+      seen.add(device);
+      remotes.push({ id: device, label: group.deviceLabel || device });
+    }
+    return { hasLocal, hasRemote, remotes };
+  }, [groups]);
+  const deviceFilteredGroups = useMemo(() => {
+    if (activeDeviceFilter === null) {
+      return groups;
+    }
+    return groups.filter((group) => (group.device || "") === activeDeviceFilter);
+  }, [activeDeviceFilter, groups]);
   const filteredGroups = useMemo(() => {
     if (!filter || !filterActive) {
       return null;
     }
     const now = Date.now();
-    return groups
+    return deviceFilteredGroups
       .map((group) => {
         const result = applySessionFilters(group.sessions, filter, now);
         const matchCount = result.running.length + result.rest.length;
@@ -902,8 +955,8 @@ export function MultiProjectSessionList({
         };
       })
       .filter((group) => group.sessions.length > 0 || group.totalCount > group.sessions.length);
-  }, [filter, filterActive, groups]);
-  const effectiveGroups = filteredGroups ?? groups;
+  }, [filter, filterActive, deviceFilteredGroups]);
+  const effectiveGroups = filteredGroups ?? deviceFilteredGroups;
   // 筛空提示：跨所有已加载分组找最近一条（与过滤无关，专供空态展示）
   const nearestSession = useMemo(
     () => latestSessionOf(groups.flatMap((group) => group.sessions)),
@@ -1144,6 +1197,47 @@ export function MultiProjectSessionList({
         </div>
         {headerAction ? <div style={{ display: "inline-flex", alignItems: "center" }}>{headerAction}</div> : null}
       </div>
+      {multiDeviceViewEnabled && deviceOptions.hasRemote ? (
+        <div
+          className="mindfs-session-device-bar"
+          role="group"
+          aria-label={t("devices.sessionFilterGroup")}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            padding: "6px 10px",
+            borderBottom: "1px solid var(--border-color)",
+            background: "var(--mindfs-topbar-bg, transparent)",
+            overflowX: "auto",
+            overflowY: "hidden",
+            flexShrink: 0,
+          }}
+        >
+          <style>{sessionDeviceBarScopedStyle}</style>
+          <DeviceFilterChip
+            label={t("devices.allSessions")}
+            active={activeDeviceFilter === null}
+            onClick={() => setDeviceFilter(null)}
+          />
+          {deviceOptions.hasLocal ? (
+            <DeviceFilterChip
+              label={t("device.local")}
+              active={activeDeviceFilter === ""}
+              onClick={() => setDeviceFilter("")}
+            />
+          ) : null}
+          {deviceOptions.remotes.map((device) => (
+            <DeviceFilterChip
+              key={device.id}
+              label={device.label}
+              title={device.id}
+              active={activeDeviceFilter === device.id}
+              onClick={() => setDeviceFilter(device.id)}
+            />
+          ))}
+        </div>
+      ) : null}
       {filter && onFilterChange ? (
         <SessionFilterBar filter={filter} onChange={onFilterChange} />
       ) : null}
@@ -1234,6 +1328,9 @@ export function MultiProjectSessionList({
                     >
                       {group.rootName || group.rootId}
                     </button>
+                    {group.device ? (
+                      <DeviceBadge label={group.deviceLabel || group.device} compact />
+                    ) : null}
                     <span
                       aria-hidden="true"
                       style={{

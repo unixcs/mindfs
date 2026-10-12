@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"mindfs/internal/remote"
 	"mindfs/server/internal/apperr"
 	configpkg "mindfs/server/internal/config"
 )
@@ -260,4 +262,115 @@ func (r *Registry) Rename(id, name, rootPath string) (RootInfo, error) {
 		return RootInfo{}, err
 	}
 	return dir, nil
+}
+
+// sanitizeDeviceBase lowercases the last path segment and maps every rune
+// outside [a-z0-9_-] to '-', yielding an empty result only when the segment
+// is empty (mapped to "root" by the caller).
+func sanitizeDeviceBase(remotePath string) string {
+	base := path.Base(path.Clean(strings.TrimSpace(remotePath)))
+	var b strings.Builder
+	for _, char := range base {
+		switch {
+		case char >= 'a' && char <= 'z', char >= '0' && char <= '9', char == '_', char == '-':
+			b.WriteRune(char)
+		case char >= 'A' && char <= 'Z':
+			b.WriteRune(char + ('a' - 'A'))
+		default:
+			b.WriteRune('-')
+		}
+	}
+	return b.String()
+}
+
+func deviceRootID(deviceID, remotePath string) string {
+	base := sanitizeDeviceBase(remotePath)
+	if base == "" || base == "-" {
+		base = "root"
+	}
+	return deviceID + "-" + base
+}
+
+func sameRemotePath(a, b string) bool {
+	return path.Clean(strings.TrimSpace(a)) == path.Clean(strings.TrimSpace(b))
+}
+
+// UpsertDeviceRoot registers a read-only root backed by a remote device
+// directory. The id is derived as <deviceID>-<base>; an existing id bound to
+// another path or device is rejected so local roots can never be hijacked.
+func (r *Registry) UpsertDeviceRoot(dev remote.Device, remotePath string) (RootInfo, error) {
+	dev.ID = strings.TrimSpace(dev.ID)
+	remotePath = path.Clean(strings.TrimSpace(remotePath))
+	if dev.ID == "" {
+		return RootInfo{}, errors.New("device id required")
+	}
+	if !path.IsAbs(remotePath) {
+		return RootInfo{}, errors.New("device root path must be absolute")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now().UTC()
+	id := deviceRootID(dev.ID, remotePath)
+	if !validRootID(id) {
+		return RootInfo{}, errors.New("invalid device root id")
+	}
+	if existing, ok := r.dirs[id]; ok {
+		if existing.Device != dev.ID || !sameRemotePath(existing.RootPath, remotePath) {
+			return RootInfo{}, fmt.Errorf("%w: root %q already exists (device=%q path=%s)", ErrRootNameConflict, id, existing.Device, existing.RootPath)
+		}
+		existing.UpdatedAt = now
+		r.dirs[id] = existing
+		return existing, r.saveLocked()
+	}
+	root := RootInfo{
+		ID:           id,
+		Name:         id,
+		RootPath:     remotePath,
+		Device:       dev.ID,
+		MetaLocation: MetaLocationHome,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	r.dirs[id] = root
+	r.order = append(r.order, id)
+	return root, r.saveLocked()
+}
+
+// RemoveByDevice unregisters every root derived from the given device.
+func (r *Registry) RemoveByDevice(deviceID string) error {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return errors.New("device id required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := make([]string, 0, len(r.order))
+	changed := false
+	for _, id := range r.order {
+		if dir, ok := r.dirs[id]; ok && dir.Device == deviceID {
+			delete(r.dirs, id)
+			changed = true
+			continue
+		}
+		kept = append(kept, id)
+	}
+	if !changed {
+		return nil
+	}
+	r.order = kept
+	return r.saveLocked()
+}
+
+// ListByDevice returns the registered roots derived from the given device.
+func (r *Registry) ListByDevice(deviceID string) []RootInfo {
+	deviceID = strings.TrimSpace(deviceID)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	result := make([]RootInfo, 0, len(r.order))
+	for _, id := range r.order {
+		if dir, ok := r.dirs[id]; ok && dir.Device == deviceID {
+			result = append(result, dir)
+		}
+	}
+	return result
 }

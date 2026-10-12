@@ -10,11 +10,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"mindfs/internal/remote"
 	agenttypes "mindfs/server/internal/agent/types"
 	configpkg "mindfs/server/internal/config"
 )
@@ -48,6 +50,8 @@ type Status struct {
 	Brief                         string                   `json:"brief,omitempty"`
 	Label                         string                   `json:"label,omitempty"`
 	URL                           string                   `json:"url,omitempty"`
+	Device                        string                   `json:"device,omitempty"`
+	DeviceLabel                   string                   `json:"device_label,omitempty"`
 	InstallCommands               []string                 `json:"install_commands,omitempty"`
 	UpdateCommands                []string                 `json:"update_commands,omitempty"`
 }
@@ -127,7 +131,7 @@ func NewProber(cfg *Config, pool *Pool, probeInterval time.Duration) *Prober {
 	if cfg != nil {
 		now := time.Now().UTC()
 		for _, def := range cfg.Agents {
-			p.statuses[def.Name] = normalizeStatus(probeInstallStatus(def.Name, def, now))
+			p.statuses[def.Name] = normalizeStatus(probeInstallStatus(def.Name, def, now, pool, false))
 			p.seedMetadataLocked(def)
 		}
 	}
@@ -334,20 +338,25 @@ func (p *Prober) Start(ctx context.Context) {
 	ticker := time.NewTicker(p.probeInterval)
 	go func() {
 		defer ticker.Stop()
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("[agent/probe] ticker.panic recovered=%v", r)
-			}
-		}()
-		for {
-			select {
-			case <-ticker.C:
-				p.probeMissingCommands()
-			case <-p.stopCh:
-				return
-			case <-ctx.Done():
-				return
-			}
+		stopped := false
+		for !stopped {
+			// recover lives inside the loop: one panicking tick must not stop
+			// the periodic missing-command probe for the process lifetime.
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[agent/probe] ticker.panic recovered=%v", r)
+					}
+				}()
+				select {
+				case <-ticker.C:
+					p.probeMissingCommands()
+				case <-p.stopCh:
+					stopped = true
+				case <-ctx.Done():
+					stopped = true
+				}
+			}()
 		}
 	}()
 }
@@ -368,6 +377,7 @@ func (p *Prober) UpdateConfig(ctx context.Context, cfg *Config) {
 	}
 	now := time.Now().UTC()
 	var installed []Definition
+	var devicePending []Definition
 	p.mu.Lock()
 	p.cfg = cfg
 	for _, def := range cfg.Agents {
@@ -375,16 +385,39 @@ func (p *Prober) UpdateConfig(ctx context.Context, cfg *Config) {
 		if _, ok := p.statuses[def.Name]; ok {
 			continue
 		}
-		status := normalizeStatus(probeInstallStatus(def.Name, def, now))
+		status := normalizeStatus(probeInstallStatus(def.Name, def, now, p.pool, false))
 		p.statuses[def.Name] = status
 		if status.Installed {
 			installed = append(installed, def)
+			continue
+		}
+		// Device agents seeded without an SSH round trip need an immediate
+		// install probe, otherwise they stay "probe pending" until the next
+		// periodic tick (up to probeInterval away).
+		if strings.TrimSpace(def.Device) != "" {
+			devicePending = append(devicePending, def)
 		}
 	}
 	p.mu.Unlock()
+	// Background probes must not inherit the caller's context: UpdateConfig is
+	// routinely called from HTTP handlers whose request ends before the probe
+	// does, which would cancel the probe mid-flight.
 	if len(installed) > 0 && shouldRunBackgroundRuntimeProbe(runtime.GOOS) {
-		go p.probeInstalledAgents(ctx, installed)
+		go p.probeInstalledAgents(context.Background(), installed)
 	}
+	if len(devicePending) > 0 {
+		go p.probeDevicePending(devicePending)
+	}
+}
+
+// probeDevicePending runs the full probe (SSH install check + runtime session
+// open) for device agents that were hot-provisioned while the server is
+// running. Both round trips go over SSH, so the caller's context — often an
+// HTTP request that finishes before the probe does — must not gate them.
+func (p *Prober) probeDevicePending(defs []Definition) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	p.probeConfiguredAgents(ctx, defs)
 }
 
 func shouldRunBackgroundRuntimeProbe(goos string) bool {
@@ -587,7 +620,7 @@ func (p *Prober) GetConfiguredStatuses() []Status {
 			statuses = append(statuses, p.applyMetadataLocked(st))
 			continue
 		}
-		statuses = append(statuses, p.applyMetadataLocked(normalizeStatus(probeInstallStatus(def.Name, def, now))))
+		statuses = append(statuses, p.applyMetadataLocked(normalizeStatus(probeInstallStatus(def.Name, def, now, p.pool, false))))
 	}
 	return statuses
 }
@@ -614,7 +647,7 @@ func (p *Prober) IsAvailable(name string) bool {
 }
 
 func probeConfiguredAgentWithPool(ctx context.Context, name string, def Definition, pool *Pool, probeSessions *probeSessionStore, phase probePhase) Status {
-	status := probeInstallStatus(name, def, time.Now().UTC())
+	status := probeInstallStatus(name, def, time.Now().UTC(), pool, true)
 	if !status.Installed {
 		return status
 	}
@@ -863,7 +896,7 @@ func unavailableStatus(name string, installed bool, errMsg string, ts time.Time)
 	}
 }
 
-func probeInstallStatus(name string, def Definition, ts time.Time) Status {
+func probeInstallStatus(name string, def Definition, ts time.Time, pool *Pool, probeRemoteNow bool) Status {
 	status := unavailableStatus(name, false, "", ts)
 	status.Protocol = agentDefinitionProtocol(name, def)
 	status.Brief = strings.TrimSpace(def.Brief)
@@ -875,6 +908,9 @@ func probeInstallStatus(name string, def Definition, ts time.Time) Status {
 		status.ProbeError = "command required"
 		return status
 	}
+	if deviceID := strings.TrimSpace(def.Device); deviceID != "" {
+		return probeDeviceInstallStatus(status, def, deviceID, pool, probeRemoteNow)
+	}
 	if _, err := exec.LookPath(def.Command); err != nil {
 		status.ProbeError = err.Error()
 		return status
@@ -882,6 +918,66 @@ func probeInstallStatus(name string, def Definition, ts time.Time) Status {
 	status.Installed = true
 	status.ProbeError = "probe pending"
 	return status
+}
+
+// probeDeviceInstallStatus checks a device-scoped agent: install means the
+// command exists on the remote device, probed over SSH. When probeRemoteNow
+// is false (startup seed / API fallback paths) the SSH round-trip is skipped
+// and left to the background probe loop.
+func probeDeviceInstallStatus(status Status, def Definition, deviceID string, pool *Pool, probeRemoteNow bool) Status {
+	status.Device = deviceID
+	device, ok := lookupProbeDevice(pool, deviceID)
+	if !ok {
+		status.ProbeError = "device not configured: " + deviceID
+		return status
+	}
+	status.DeviceLabel = device.DisplayName()
+	if !device.Enabled {
+		status.Error = "device disabled"
+		status.ProbeError = "device disabled: " + device.DisplayName()
+		return status
+	}
+	if !probeRemoteNow {
+		status.ProbeError = "probe pending"
+		return status
+	}
+	remoteCmd := "command -v " + remote.Quote(def.Command) + " >/dev/null 2>&1"
+	if err := probeRemoteDevice(pool, device, remoteCmd); err != nil {
+		status.ProbeError = err.Error()
+		return status
+	}
+	status.Installed = true
+	status.ProbeError = "probe pending"
+	return status
+}
+
+func lookupProbeDevice(pool *Pool, deviceID string) (remote.Device, bool) {
+	if pool == nil {
+		return remote.Device{}, false
+	}
+	resolver, _ := pool.deviceSupport()
+	if resolver == nil {
+		return remote.Device{}, false
+	}
+	return resolver(deviceID)
+}
+
+func probeRemoteDevice(pool *Pool, device remote.Device, remoteCmd string) error {
+	if pool == nil {
+		return errors.New("device support not configured")
+	}
+	_, configDir := pool.deviceSupport()
+	if configDir == "" {
+		return errors.New("device support not configured")
+	}
+	muxDir, err := remote.MuxDir(configDir)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	_, err = remote.Run(ctx, device.Target(), muxDir, remoteCmd, 10*time.Second)
+	return err
 }
 
 func agentDefinitionProtocol(name string, def Definition) Protocol {
@@ -1133,7 +1229,7 @@ func (p *Prober) probeInstallOnly(defs []Definition) {
 	}
 
 	p.runDefinitionsConcurrently(defs, func(_ int, def Definition) {
-		status := probeInstallStatus(def.Name, def, time.Now().UTC())
+		status := probeInstallStatus(def.Name, def, time.Now().UTC(), p.pool, true)
 		p.setStatus(status)
 	})
 }
@@ -1155,7 +1251,9 @@ func safeProbeConfiguredAgentWithPool(ctx context.Context, name string, def Defi
 	defer func() {
 		if r := recover(); r != nil {
 			status = unavailableStatus(name, true, fmt.Sprintf("probe panic: %v", r), time.Now().UTC())
+			status.Device = strings.TrimSpace(def.Device)
 			log.Printf("[agent/probe] probe.panic agent=%s phase=%s recovered=%v", name, phase, r)
+			log.Printf("[agent/probe] probe.panic.stack %s", debug.Stack())
 		}
 	}()
 	return probeConfiguredAgentWithPool(ctx, name, def, pool, probeSessions, phase)

@@ -14,6 +14,9 @@ export type AgentStatus = {
   version?: string;
   error?: string;
   last_probe?: string;
+  /** Owning remote device id; empty/undefined for local agents. */
+  device?: string;
+  device_label?: string;
   current_model_id?: string;
   current_mode_id?: string;
   default_model_id?: string;

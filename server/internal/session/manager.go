@@ -12,13 +12,16 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"mindfs/internal/remote"
 	agenttypes "mindfs/server/internal/agent/types"
 	configpkg "mindfs/server/internal/config"
 	"mindfs/server/internal/fs"
@@ -2228,4 +2231,452 @@ func generateKey() string {
 		return fmt.Sprintf("%d", now)
 	}
 	return fmt.Sprintf("%d-%s", now, hex.EncodeToString(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Session mirror import (多设备 CLI 聚合)
+//
+// A remote device's MindFS instance stores session meta in the same sqlite
+// layout as this one. The mirror pipeline fetches a root's remote meta dir
+// (internal/remote/mirror.go), extracts it into a temp directory and hands it
+// to ImportMirrorBundle, which merges the remote sessions into this root's
+// local session store.
+// ---------------------------------------------------------------------------
+
+const upsertMirrorBindingSQL = `
+INSERT INTO session_agent_bindings (
+	session_key, agent, agent_session_id, agent_ctx_seq, external_source_path, external_source_offset, external_source_mtime_ns
+) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(session_key, agent) DO UPDATE SET
+	agent_session_id = excluded.agent_session_id,
+	agent_ctx_seq = excluded.agent_ctx_seq,
+	external_source_path = excluded.external_source_path,
+	external_source_offset = excluded.external_source_offset,
+	external_source_mtime_ns = excluded.external_source_mtime_ns`
+
+// MirrorImportInput describes one fetched remote meta bundle.
+type MirrorImportInput struct {
+	// DeviceID names the remote device the bundle came from; imported
+	// sessions are tagged Source = "remote:<deviceID>".
+	DeviceID string
+	// SourceDir is the local temp dir holding the fetched remote meta layout:
+	// SourceDir/sessions/session-list.db and SourceDir/sessions/<key>.jsonl.
+	SourceDir string
+	// RemoteSessionsDir is the remote-side sessions dir path. It fills a
+	// binding's external_source_path when the remote row left it empty, so
+	// resume cursors can still point at the authoritative remote log.
+	RemoteSessionsDir string
+	// MapAgent rewrites a remote agent name into this instance's device agent
+	// name (e.g. "codex" -> "jp-codex"). found=false keeps the original name;
+	// the session is still imported and the name is reported via
+	// Result.SkippedAgents.
+	MapAgent func(agent string) (mapped string, found bool)
+}
+
+// MirrorImportResult aggregates one ImportMirrorBundle run.
+type MirrorImportResult struct {
+	Imported int
+	Updated  int
+	Skipped  int
+	// SkippedAgents lists (deduplicated) agent names that had no mapped
+	// device agent and therefore kept their original binding name.
+	SkippedAgents []string
+	Errors        []string
+}
+
+const mirrorMaxErrors = 20
+
+func (r *MirrorImportResult) addError(format string, args ...any) {
+	if len(r.Errors) >= mirrorMaxErrors {
+		return
+	}
+	r.Errors = append(r.Errors, fmt.Sprintf(format, args...))
+}
+
+// ImportMirrorBundle merges a fetched remote meta bundle into this root's
+// session store. It is conflict-aware: when a session key already exists
+// locally, the copy with the newer UpdatedAt wins (local never regresses).
+//
+// The remote sqlite db is opened read-only and validated with
+// PRAGMA integrity_check first; a corrupt db is skipped with an error entry,
+// while the plain jsonl logs are still copied so no history is lost.
+func (m *Manager) ImportMirrorBundle(_ context.Context, input MirrorImportInput) (MirrorImportResult, error) {
+	var result MirrorImportResult
+	deviceID := strings.TrimSpace(input.DeviceID)
+	if deviceID == "" {
+		return result, errors.New("device id required")
+	}
+	sourceDir := strings.TrimSpace(input.SourceDir)
+	if sourceDir == "" {
+		return result, errors.New("mirror source dir required")
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dbPath := filepath.Join(sourceDir, filepath.FromSlash(sessionDBPath))
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			// Nothing fetched (fresh remote root) — not an error.
+			return result, nil
+		}
+		return result, err
+	}
+
+	remoteDB, err := openSQLiteDB(dbPath)
+	if err != nil {
+		result.addError("open remote session db: %v", err)
+		return result, nil
+	}
+	remoteDB.SetMaxOpenConns(1)
+	defer remoteDB.Close()
+
+	// Corrupt-db tolerance: validate before trusting any row.
+	var integrity string
+	if err := remoteDB.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
+		result.addError("remote session db integrity_check failed (%v, %s); skipping db import, copying logs only", err, integrity)
+	} else {
+		sessionRows, err := loadMirrorTable(remoteDB, "sessions")
+		if err != nil {
+			result.addError("read remote sessions: %v", err)
+		} else {
+			bindingRows, bindErr := loadMirrorTable(remoteDB, "session_agent_bindings")
+			if bindErr != nil {
+				result.addError("read remote agent bindings: %v", bindErr)
+				bindingRows = nil
+			}
+			bindingsBySession := make(map[string][]map[string]any, len(bindingRows))
+			for _, row := range bindingRows {
+				key := mirrorRowString(row, "session_key")
+				if key == "" {
+					continue
+				}
+				bindingsBySession[key] = append(bindingsBySession[key], row)
+			}
+			for _, row := range sessionRows {
+				m.importMirrorSessionUnsafe(row, bindingsBySession, input, &result)
+			}
+		}
+	}
+
+	// Even when the db is missing/corrupt, copy whatever plain logs arrived
+	// so history stays inspectable.
+	m.copyUnclaimedMirrorLogsUnsafe(input, &result)
+	return result, nil
+}
+
+func (m *Manager) importMirrorSessionUnsafe(row map[string]any, bindingsBySession map[string][]map[string]any, input MirrorImportInput, result *MirrorImportResult) {
+	key := mirrorRowString(row, "key")
+	if key == "" {
+		result.Skipped++
+		return
+	}
+	// Session keys become file names under the meta dir; anything outside the
+	// whitelist is rejected instead of written to disk.
+	if !remote.IsValidSessionKey(key) {
+		result.Skipped++
+		result.addError("session %s: invalid key, skipped", key)
+		return
+	}
+	remoteUpdatedAt, err := mirrorRowTime(row, "updated_at")
+	if err != nil {
+		result.Skipped++
+		result.addError("session %s: bad updated_at, skipped", key)
+		return
+	}
+
+	local, err := m.getSessionMetaUnsafe(key)
+	if err == nil && local != nil {
+		if !local.UpdatedAt.Before(remoteUpdatedAt) {
+			// Local copy is newer or equal — mirror import never regresses it.
+			result.Skipped++
+			return
+		}
+	} else if err != nil && !errors.Is(err, errSessionNotFound) {
+		result.addError("session %s: read local meta: %v", key, err)
+		return
+	}
+
+	createdAt, err := mirrorRowTime(row, "created_at")
+	if err != nil {
+		createdAt = remoteUpdatedAt
+	}
+	name := mirrorRowString(row, "name")
+	if strings.TrimSpace(name) == "" {
+		name = "New Session"
+	}
+	sessionType := mirrorRowString(row, "type")
+	if strings.TrimSpace(sessionType) == "" {
+		sessionType = TypeChat
+	}
+	session := &Session{
+		Key:              key,
+		Type:             sessionType,
+		ParentSessionKey: mirrorRowString(row, "parent_session_key"),
+		ParentToolCallID: mirrorRowString(row, "parent_tool_call_id"),
+		// Mirror provenance: the UI and SendMessage paths use this to tell a
+		// mirrored remote session from a locally created one.
+		Source:       "remote:" + deviceTag(input.DeviceID),
+		TaskID:       mirrorRowString(row, "task_id"),
+		Model:        mirrorRowString(row, "model"),
+		Shell:        mirrorRowString(row, "shell"),
+		PlanMode:     mirrorRowInt64(row, "plan_mode") != 0,
+		Name:         name,
+		Exchanges:    []Exchange{},
+		RelatedFiles: []RelatedFile{},
+		CreatedAt:    createdAt.UTC(),
+		UpdatedAt:    remoteUpdatedAt.UTC(),
+	}
+	if err := m.upsertSessionMetaUnsafe(session); err != nil {
+		result.addError("session %s: upsert meta: %v", key, err)
+		return
+	}
+
+	imported := local == nil // local==nil means the key is new to this store
+	m.copyMirrorLogUnsafe(key, input)
+	if err := m.importMirrorBindingsUnsafe(key, bindingsBySession[key], input, result); err != nil {
+		result.addError("session %s: rewrite bindings: %v", key, err)
+		return
+	}
+	// Invalidate the in-memory cache so the next Get re-reads the imported
+	// meta + log (same pattern as the other mutation paths).
+	delete(m.sessions, key)
+	if imported {
+		result.Imported++
+	} else {
+		result.Updated++
+	}
+}
+
+// deviceTag keeps device ids whitelist-shaped inside Source values.
+func deviceTag(deviceID string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return -1
+	}, strings.TrimSpace(deviceID))
+}
+
+// copyMirrorLogUnsafe copies the remote jsonl (and aux log when present) for
+// key into the local meta dir. Copying is skipped when the local file already
+// has the same size (cheap "content unchanged" proxy). The meta row is
+// already authoritative for UpdatedAt, so a size mismatch means the remote
+// log advanced and must be replaced.
+func (m *Manager) copyMirrorLogUnsafe(key string, input MirrorImportInput) bool {
+	logPath, err := m.exchangePath(key)
+	if err != nil {
+		return false
+	}
+	payload, err := os.ReadFile(filepath.Join(input.SourceDir, filepath.FromSlash(logPath)))
+	if err != nil {
+		return false
+	}
+	m.writeMirrorMetaFileIfChangedUnsafe(logPath, payload)
+	if auxPath, err := m.auxPath(key); err == nil {
+		if auxPayload, err := os.ReadFile(filepath.Join(input.SourceDir, filepath.FromSlash(auxPath))); err == nil {
+			m.writeMirrorMetaFileIfChangedUnsafe(auxPath, auxPayload)
+		}
+	}
+	return true
+}
+
+func (m *Manager) writeMirrorMetaFileIfChangedUnsafe(relPath string, payload []byte) {
+	absPath := filepath.Join(m.root.MetaDir(), filepath.FromSlash(relPath))
+	if info, err := os.Stat(absPath); err == nil && info.Size() == int64(len(payload)) {
+		return
+	}
+	if err := m.root.WriteMetaFile(relPath, payload); err != nil {
+		log.Printf("[session/mirror] write %s failed: %v", relPath, err)
+	}
+}
+
+func (m *Manager) importMirrorBindingsUnsafe(sessionKey string, rows []map[string]any, input MirrorImportInput, result *MirrorImportResult) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	db, err := m.ensureSessionMetaDBUnsafe()
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		agent := mirrorRowString(row, "agent")
+		if strings.TrimSpace(agent) == "" {
+			continue
+		}
+		mapped := agent
+		if input.MapAgent != nil {
+			if next, found := input.MapAgent(agent); found && strings.TrimSpace(next) != "" {
+				mapped = strings.TrimSpace(next)
+			} else if !found && !containsAgent(result.SkippedAgents, agent) {
+				// No device agent for this name: keep the original binding so
+				// the session still renders, but surface it to the caller.
+				result.SkippedAgents = append(result.SkippedAgents, agent)
+			}
+		}
+		externalPath := mirrorRowString(row, "external_source_path")
+		if externalPath == "" && strings.TrimSpace(input.RemoteSessionsDir) != "" {
+			externalPath = path.Join(filepath.ToSlash(input.RemoteSessionsDir), agent+".jsonl")
+		}
+		if _, err := db.Exec(upsertMirrorBindingSQL,
+			sessionKey,
+			mapped,
+			mirrorRowString(row, "agent_session_id"),
+			mirrorRowInt64(row, "agent_ctx_seq"),
+			externalPath,
+			mirrorRowInt64(row, "external_source_offset"),
+			mirrorRowInt64(row, "external_source_mtime_ns"),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// copyUnclaimedMirrorLogsUnsafe copies remote jsonl logs that have no
+// importable meta row (e.g. the remote db failed integrity_check). Such logs
+// are not listed anywhere until a later successful sync imports their meta;
+// copying keeps the data on disk instead of dropping it.
+func (m *Manager) copyUnclaimedMirrorLogsUnsafe(input MirrorImportInput, result *MirrorImportResult) {
+	entries, err := os.ReadDir(filepath.Join(input.SourceDir, filepath.FromSlash("sessions")))
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || name == sessionDBPathBase || !strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".aux.jsonl") {
+			continue
+		}
+		key := strings.TrimSuffix(name, ".jsonl")
+		if !remote.IsValidSessionKey(key) {
+			continue
+		}
+		if _, err := m.getSessionMetaUnsafe(key); err == nil {
+			continue // meta row exists; import path handled the log copy
+		}
+		payload, err := os.ReadFile(filepath.Join(input.SourceDir, "sessions", name))
+		if err != nil {
+			continue
+		}
+		if relPath, err := m.exchangePath(key); err == nil {
+			m.writeMirrorMetaFileIfChangedUnsafe(relPath, payload)
+		}
+	}
+}
+
+const sessionDBPathBase = "session-list.db"
+
+func containsAgent(items []string, agent string) bool {
+	for _, item := range items {
+		if item == agent {
+			return true
+		}
+	}
+	return false
+}
+
+// loadMirrorTable reads a whole table with column-name-tolerant mapping, so a
+// remote instance running an older/newer schema still imports.
+func loadMirrorTable(db *sql.DB, table string) ([]map[string]any, error) {
+	rows, err := db.Query("SELECT * FROM " + table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, 32)
+	for rows.Next() {
+		values := make([]any, len(columns))
+		ptrs := make([]any, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]any, len(columns))
+		for i, column := range columns {
+			row[column] = values[i]
+		}
+		out = append(out, row)
+	}
+	return out, rows.Err()
+}
+
+func mirrorRowString(row map[string]any, column string) string {
+	switch value := row[column].(type) {
+	case string:
+		return value
+	case []byte:
+		return string(value)
+	default:
+		return ""
+	}
+}
+
+func mirrorRowInt64(row map[string]any, column string) int64 {
+	switch value := row[column].(type) {
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	case float64:
+		return int64(value)
+	case string:
+		parsed, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func mirrorRowTime(row map[string]any, column string) (time.Time, error) {
+	raw := strings.TrimSpace(mirrorRowString(row, column))
+	if raw == "" {
+		return time.Time{}, fmt.Errorf("column %s empty", column)
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05"} {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("column %s not a timestamp: %q", column, raw)
+}
+
+// ExchangeLogExists reports whether the local exchange log for key exists.
+func (m *Manager) ExchangeLogExists(key string) bool {
+	logPath, err := m.exchangePath(key)
+	if err != nil {
+		return false
+	}
+	if _, err := m.root.ReadMetaFile(logPath); err != nil {
+		return false
+	}
+	return true
+}
+
+// WriteExchangeLogIfMissing stores payload as sessions/<key>.jsonl when the
+// local log does not exist yet (lazy mirror pull). It returns whether a write
+// happened and invalidates the in-memory cache so the next Get reloads.
+func (m *Manager) WriteExchangeLogIfMissing(key string, payload []byte) (bool, error) {
+	logPath, err := m.exchangePath(key)
+	if err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.root.ReadMetaFile(logPath); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if err := m.root.WriteMetaFile(logPath, payload); err != nil {
+		return false, err
+	}
+	delete(m.sessions, key)
+	return true, nil
 }

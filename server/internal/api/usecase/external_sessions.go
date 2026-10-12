@@ -79,7 +79,9 @@ func (s *Service) ListExternalSessions(ctx context.Context, in ListExternalSessi
 	if err := s.ensureRegistry(); err != nil {
 		return ListExternalSessionsOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	// External-session importers scan RootPath on THIS machine; a device root
+	// would read whatever same-named directory exists locally.
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return ListExternalSessionsOutput{}, err
 	}
@@ -164,7 +166,7 @@ func (s *Service) ImportExternalSession(ctx context.Context, in ImportExternalSe
 	if err := s.ensureRegistry(); err != nil {
 		return ImportExternalSessionOutput{}, err
 	}
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return ImportExternalSessionOutput{}, err
 	}
@@ -273,7 +275,7 @@ func (s *Service) SyncExternalSessionDelta(ctx context.Context, in SyncExternalS
 	lock.Lock()
 	defer lock.Unlock()
 
-	root, err := s.Registry.GetRoot(in.RootID)
+	root, err := s.ensureWritableLocalRoot(in.RootID)
 	if err != nil {
 		return out, err
 	}
