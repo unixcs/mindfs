@@ -1,4 +1,4 @@
-import { protectedJSON } from "./api";
+import { protectedJSON, ProtectedAPIError } from "./api";
 import { appPath } from "./base";
 
 function pinnedModels(value: unknown): string[] {
@@ -205,4 +205,62 @@ export async function updateIdleSessionResourceReleasePreference(
       body: JSON.stringify(preference),
     }),
   );
+}
+
+// Client UI preference: the float-ball gesture map, per-region font sizes and
+// appearance mode, kept server-side as an opaque blob (schema owned by the
+// frontend, versioned inside the blob) so browser caches clearing no longer
+// wipes the user's most-cherished settings.
+export type ClientUIPayload = {
+  v: number;
+  gestures?: unknown;
+  fontSizes?: unknown;
+  appearance?: unknown;
+};
+
+export type ClientUIFetchResult =
+  | { supported: false }
+  | { supported: true; configured: boolean; data: ClientUIPayload | null };
+
+function normalizeClientUIPayload(value: unknown): ClientUIPayload | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as ClientUIPayload;
+}
+
+export async function fetchClientUIPreference(): Promise<ClientUIFetchResult> {
+  try {
+    const value = await protectedJSON<Record<string, unknown> | null>(
+      appPath("/api/preferences/client-ui"),
+    );
+    return {
+      supported: true,
+      configured: value?.configured === true,
+      data: normalizeClientUIPayload(value?.data ?? null),
+    };
+  } catch (error) {
+    // An older backend without this route must not enable double-write.
+    if (error instanceof ProtectedAPIError && error.status === 404) {
+      return { supported: false };
+    }
+    throw error;
+  }
+}
+
+// Returns false when the server does not support client-ui (404), true on ack.
+export async function updateClientUIPreference(data: ClientUIPayload): Promise<boolean> {
+  try {
+    await protectedJSON(appPath("/api/preferences/client-ui"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data }),
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof ProtectedAPIError && error.status === 404) {
+      return false;
+    }
+    throw error;
+  }
 }

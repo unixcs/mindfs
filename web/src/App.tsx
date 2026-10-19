@@ -63,6 +63,7 @@ import {
 import {
   loadBlueRingGestureConfig,
   nextFontCycleScale,
+  normalizeBlueRingGestureConfig,
   persistBlueRingGestureConfig,
   type BlueRingGestureConfig,
 } from "./services/quickSwitch";
@@ -70,14 +71,25 @@ import { recordRecentDir } from "./services/recentDirs";
 import {
   fetchUILayoutPreference,
   updateUILayoutPreference,
+  fetchClientUIPreference,
+  updateClientUIPreference,
+  type ClientUIPayload,
   type UILayoutPreference,
 } from "./services/preferences";
+import {
+  APPEARANCE_CHANGE_EVENT,
+  getAppearanceMode,
+  normalizeAppearanceMode,
+  setAppearanceMode,
+  type AppearanceMode,
+} from "./services/appearance";
 import { backendNodes } from "./services/nodes";
 import { nodeDestinationURL } from "./services/nodePage";
 import { getStoredLauncherNodes, type LauncherNode } from "./services/storage";
 import { loadHandoffTemplate, renderHandoffPack } from "./services/handoff";
 import {
   loadFontSizePreferences,
+  parseFontSizePreferences,
   persistFontSizePreferences,
   type FontSizePreferences,
 } from "./services/fontSize";
@@ -1792,6 +1804,112 @@ export function App({ onGoHome }: AppProps) {
   const uiLayoutAtMountRef = useRef(uiLayoutCurrentRef.current);
   const uiLayoutPushedRef = useRef<Pick<UILayoutPreference, "sidebarsSwapped" | "gitDiffSideBySide"> | null>(null);
 
+  // Client UI (float-ball gestures / region font sizes / appearance) mirrors
+  // the ui-layout triple above: hydrate gate, at-mount untouched check, and
+  // pushed snapshot to suppress echo writes. A 404 from an older backend
+  // permanently disables double-write for this session.
+  const clientUIHydratedRef = useRef(false);
+  const [clientUIHydrated, setClientUIHydrated] = useState(false);
+  const clientUISupportedRef = useRef<boolean | null>(null);
+  const clientUIPushedRef = useRef<string | null>(null);
+  const [appearanceTick, setAppearanceTick] = useState(0);
+  const clientUICurrentRef = useRef({
+    gestures: blueRingGestures,
+    fonts: fontSizePreferences,
+    appearance: getAppearanceMode(),
+  });
+  const clientUIAtMountRef = useRef(clientUICurrentRef.current);
+
+  const buildClientUIPayload = useCallback(
+    (
+      gestures: BlueRingGestureConfig,
+      fonts: FontSizePreferences,
+      appearance: AppearanceMode,
+    ): ClientUIPayload => ({
+      v: 1,
+      gestures,
+      fontSizes: {
+        fileSidebar: fonts.fileSidebar,
+        main: fonts.main,
+        sessionSidebar: fonts.sessionSidebar,
+      },
+      appearance,
+    }),
+    [],
+  );
+
+  const hydrateClientUIPreference = useCallback(async () => {
+    if (clientUIHydratedRef.current || clientUISupportedRef.current === false) {
+      return;
+    }
+    let result;
+    try {
+      result = await fetchClientUIPreference();
+    } catch {
+      return; // server unreachable; retry on the next bootstrap trigger
+    }
+    if (!result.supported) {
+      clientUISupportedRef.current = false;
+      clientUIHydratedRef.current = true;
+      setClientUIHydrated(true);
+      return;
+    }
+    clientUISupportedRef.current = true;
+    const current = clientUICurrentRef.current;
+    const currentSnapshot = JSON.stringify(
+      buildClientUIPayload(current.gestures, current.fonts, current.appearance),
+    );
+    const untouched =
+      currentSnapshot ===
+      JSON.stringify(
+        buildClientUIPayload(
+          clientUIAtMountRef.current.gestures,
+          clientUIAtMountRef.current.fonts,
+          clientUIAtMountRef.current.appearance,
+        ),
+      );
+    if (result.configured && result.data && untouched) {
+      // 服务端为准：清缓存/换浏览器后，悬浮球手势与字体外观不再"被重置"
+      const server = result.data;
+      const nextGestures =
+        server.gestures !== undefined
+          ? normalizeBlueRingGestureConfig(server.gestures)
+          : current.gestures;
+      const nextFonts = parseFontSizePreferences(server.fontSizes) ?? current.fonts;
+      const nextAppearance =
+        typeof server.appearance === "string"
+          ? normalizeAppearanceMode(server.appearance)
+          : current.appearance;
+      clientUIPushedRef.current = JSON.stringify(
+        buildClientUIPayload(nextGestures, nextFonts, nextAppearance),
+      );
+      if (nextAppearance !== current.appearance) {
+        setAppearanceMode(nextAppearance);
+      }
+      if (nextGestures !== current.gestures) {
+        setBlueRingGestures(nextGestures);
+      }
+      if (nextFonts !== current.fonts) {
+        setFontSizePreferences(nextFonts);
+      }
+    } else {
+      // 未配置（首次播种）或挂载后用户已改动（本地新）→ 本地为准上传
+      clientUIPushedRef.current = currentSnapshot;
+      try {
+        const ok = await updateClientUIPreference(
+          buildClientUIPayload(current.gestures, current.fonts, current.appearance),
+        );
+        if (!ok) {
+          clientUISupportedRef.current = false;
+        }
+      } catch {
+        clientUIPushedRef.current = null;
+      }
+    }
+    clientUIHydratedRef.current = true;
+    setClientUIHydrated(true);
+  }, [buildClientUIPayload]);
+
   const hydrateUILayoutPreference = useCallback(async () => {
     if (uiLayoutHydratedRef.current) {
       return;
@@ -2554,6 +2672,43 @@ export function App({ onGoHome }: AppProps) {
       uiLayoutPushedRef.current = pushed;
     });
   }, [sidebarsSwapped, gitDiffSideBySide, uiLayoutHydrated]);
+
+  useEffect(() => {
+    const syncAppearanceTick = () => setAppearanceTick((tick) => tick + 1);
+    window.addEventListener(APPEARANCE_CHANGE_EVENT, syncAppearanceTick);
+    return () => window.removeEventListener(APPEARANCE_CHANGE_EVENT, syncAppearanceTick);
+  }, []);
+
+  useEffect(() => {
+    clientUICurrentRef.current = {
+      gestures: blueRingGestures,
+      fonts: fontSizePreferences,
+      appearance: getAppearanceMode(),
+    };
+  }, [blueRingGestures, fontSizePreferences, appearanceTick]);
+
+  useEffect(() => {
+    if (!clientUIHydrated || clientUISupportedRef.current !== true) {
+      return;
+    }
+    const current = clientUICurrentRef.current;
+    const payload = buildClientUIPayload(current.gestures, current.fonts, current.appearance);
+    const snapshot = JSON.stringify(payload);
+    const pushed = clientUIPushedRef.current;
+    if (pushed === snapshot) {
+      return;
+    }
+    clientUIPushedRef.current = snapshot;
+    void updateClientUIPreference(payload)
+      .then((ok) => {
+        if (!ok) {
+          clientUISupportedRef.current = false;
+        }
+      })
+      .catch(() => {
+        clientUIPushedRef.current = pushed;
+      });
+  }, [blueRingGestures, fontSizePreferences, appearanceTick, clientUIHydrated, buildClientUIPayload]);
 
   const [managedRootIds, setManagedRootIds] = useState<string[]>([]);
   const managedRootByIdRef = useRef<Record<string, ManagedRootPayload>>({});
@@ -11441,6 +11596,7 @@ export function App({ onGoHome }: AppProps) {
     setAgentsVersion((v) => v + 1);
     void loadTaskTemplates();
     void hydrateUILayoutPreference();
+    void hydrateClientUIPreference();
     void loadKanbanTasks(currentRootIdRef.current);
     if (multiProjectSessionsEnabled) {
       void loadMultiProjectSessionGroups();
@@ -11448,6 +11604,7 @@ export function App({ onGoHome }: AppProps) {
   }, [
     bootstrapState.phase,
     hydrateUILayoutPreference,
+    hydrateClientUIPreference,
     loadKanbanTasks,
     loadMultiProjectSessionGroups,
     loadTaskTemplates,

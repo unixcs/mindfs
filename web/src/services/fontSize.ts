@@ -27,15 +27,33 @@ export function loadFontSizePreferences(): FontSizePreferences {
     return DEFAULT_FONT_SIZE_PREFERENCES;
   }
   try {
-    const saved = JSON.parse(window.localStorage.getItem(FONT_SIZE_STORAGE_KEY) || "{}") as Partial<FontSizePreferences>;
-    return {
-      fileSidebar: normalizeScale(saved.fileSidebar),
-      main: normalizeScale(saved.main),
-      sessionSidebar: normalizeScale(saved.sessionSidebar),
-    };
+    return parseFontSizePreferences(window.localStorage.getItem(FONT_SIZE_STORAGE_KEY) || "{}") ?? DEFAULT_FONT_SIZE_PREFERENCES;
   } catch {
     return DEFAULT_FONT_SIZE_PREFERENCES;
   }
+}
+
+// parseFontSizePreferences normalizes an unknown value (localStorage JSON or
+// a server-replicated blob). Returns null when the value is not a usable
+// object, so callers can distinguish "absent" from "partial".
+export function parseFontSizePreferences(value: unknown): FontSizePreferences | null {
+  let input = value;
+  if (typeof input === "string") {
+    try {
+      input = JSON.parse(input);
+    } catch {
+      return null;
+    }
+  }
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return null;
+  }
+  const record = input as Partial<Record<FontSizeRegion, unknown>>;
+  return {
+    fileSidebar: normalizeScale(record.fileSidebar),
+    main: normalizeScale(record.main),
+    sessionSidebar: normalizeScale(record.sessionSidebar),
+  };
 }
 
 export function persistFontSizePreferences(preferences: FontSizePreferences): void {

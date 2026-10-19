@@ -35,6 +35,14 @@ type UserPreferences struct {
 	AgentHidden                     []string                 `json:"agent_hidden,omitempty"`
 	AgentVisibilityCustomized       bool                     `json:"agent_visibility_customized,omitempty"`
 	UILayout                        *storedUILayout          `json:"ui_layout,omitempty"`
+	// ClientUI is the opaque browser-side settings blob (float-ball gestures,
+	// font sizes, appearance mode). The server stores it verbatim; the schema
+	// and its versioning belong to the frontend.
+	ClientUI json.RawMessage `json:"client_ui,omitempty"`
+	// SyncedAtMs is the wall-clock time of the last change to the syncable
+	// subset (ui_layout, fork_ownership, client_ui). Cross-instance reconcilers
+	// compare it to decide which copy wins; ties fall back to content hash.
+	SyncedAtMs int64 `json:"synced_at_ms,omitempty"`
 	// ForkOwnership decides where a newly forked session lands:
 	//   "nested"   – under its parent session (default, cascade-deleted with it)
 	//   "detached" – at top level, parallel to the parent, survives its deletion
@@ -158,9 +166,46 @@ func (s *Store) UpdateUILayout(sidebarsSwapped, gitDiffSideBySide bool) error {
 	}
 	next := &storedUILayout{SidebarsSwapped: &sidebarsSwapped, GitDiffSideBySide: &gitDiffSideBySide}
 	previous := s.data.UILayout
+	previousMs := s.data.SyncedAtMs
 	s.data.UILayout = next
+	s.data.SyncedAtMs = syncedNow().UnixMilli()
 	if err := s.saveLocked(); err != nil {
 		s.data.UILayout = previous
+		s.data.SyncedAtMs = previousMs
+		return err
+	}
+	return nil
+}
+
+// ClientUI returns the opaque browser settings blob and whether one is stored.
+func (s *Store) ClientUI() (json.RawMessage, bool) {
+	if s == nil || len(s.data.ClientUI) == 0 {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append(json.RawMessage{}, s.data.ClientUI...), len(s.data.ClientUI) > 0
+}
+
+func (s *Store) UpdateClientUI(raw json.RawMessage) error {
+	if s == nil {
+		return nil
+	}
+	if !json.Valid(raw) {
+		return errors.New("client ui is not valid json")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if string(s.data.ClientUI) == string(raw) {
+		return nil
+	}
+	previous := s.data.ClientUI
+	previousMs := s.data.SyncedAtMs
+	s.data.ClientUI = append(json.RawMessage{}, raw...)
+	s.data.SyncedAtMs = syncedNow().UnixMilli()
+	if err := s.saveLocked(); err != nil {
+		s.data.ClientUI = previous
+		s.data.SyncedAtMs = previousMs
 		return err
 	}
 	return nil
@@ -198,11 +243,14 @@ func (s *Store) UpdateForkOwnership(ownership string) error {
 		return nil
 	}
 	previous := s.data.ForkOwnership
+	previousMs := s.data.SyncedAtMs
 	s.data.ForkOwnership = ownership
+	s.data.SyncedAtMs = syncedNow().UnixMilli()
 	if err := s.saveLocked(); err != nil {
 		// Keep memory and disk consistent: a failed write must not leave the
 		// process on the new value while the file still holds the old one.
 		s.data.ForkOwnership = previous
+		s.data.SyncedAtMs = previousMs
 		return err
 	}
 	return nil
