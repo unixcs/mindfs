@@ -31,3 +31,7 @@ harmony/entry/src/main/resources/rawfile/public/
 .zcode/
 .agents/
 .zcodeignore
+
+# 本地构建产物（不入仓）
+mindfs-amd64
+mindfs-arm64
