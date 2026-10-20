@@ -1759,6 +1759,18 @@ func (h *HTTPHandler) serveStaticAsset(w http.ResponseWriter, r *http.Request) b
 			h.serveFrontendIndex(w, r, staticDir, assetPath)
 			return true
 		}
+		// PWA 安装名随 -title 实例名改写（同 applyUITitle 的理由）：manifest
+		// 是静态产物，写死 "MindFS"，三台实例装到同一部手机上分不清。只在
+		// 名字非默认时改写，避免无谓的 JSON 往返。
+		if cleanPath == "manifest.webmanifest" || cleanPath == "manifest.json" {
+			if name := strings.TrimSpace(h.UITitle); name != "" && name != "MindFS" {
+				if content, err := os.ReadFile(assetPath); err == nil {
+					w.Header().Set("Content-Type", "application/manifest+json")
+					w.Write(h.applyUIManifest(content))
+					return true
+				}
+			}
+		}
 		if h.shouldRewriteRelayedAssets(r) && shouldRewriteRelayedStaticAsset(cleanPath) {
 			serveRewrittenStaticAsset(w, r, assetPath)
 			return true
@@ -1814,6 +1826,32 @@ func (h *HTTPHandler) applyUITitle(content []byte) []byte {
 	}
 	replacement := []byte("<title>" + htmpl.HTMLEscapeString(title) + "</title>")
 	return bytes.Replace(content, []byte("<title>MindFS</title>"), replacement, 1)
+}
+
+// applyUIManifest swaps the PWA manifest's name/short_name for the -title
+// flag so instances installed to a phone's home screen are told apart
+// (MindFS-TX vs MindFS-NAS vs MindFS-Dell). Malformed JSON passes through
+// untouched; callers only invoke this when the title differs from the
+// default, so a default deployment never pays the rewrite cost.
+func (h *HTTPHandler) applyUIManifest(content []byte) []byte {
+	title := strings.TrimSpace(h.UITitle)
+	if title == "" || title == "MindFS" {
+		return content
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		return content
+	}
+	if manifest == nil {
+		return content
+	}
+	manifest["name"] = title
+	manifest["short_name"] = title
+	out, err := json.Marshal(manifest)
+	if err != nil {
+		return content
+	}
+	return out
 }
 
 func missingFrontendIndexResource(staticDir string, indexContent []byte) string {
