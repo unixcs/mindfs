@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -64,6 +65,19 @@ const (
 	probeSessionStoreFile   = "probe-sessions.json"
 )
 
+// defaultProbeParallel 限制同时探测的 Agent 数。探测会为每个 Agent 冷启动一个真实
+// CLI 进程（node 系动辄几百 MB、几十秒 CPU），低配机（NAS：4 核 ARM）上全量并发会把
+// 彼此拖过 session/new 窗口，表现成"健康 Agent 集体报不可用"。
+// MINDFS_PROBE_PARALLEL 可调（非法值回落默认），上限=Agent 数，不会更慢。
+const defaultProbeParallel = 2
+
+func probeParallelLimit() int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv("MINDFS_PROBE_PARALLEL"))); err == nil && v > 0 {
+		return v
+	}
+	return defaultProbeParallel
+}
+
 type probePhase string
 
 const (
@@ -97,6 +111,7 @@ type Prober struct {
 	metadata      map[string]agentMetadataOverride
 	mu            sync.RWMutex
 	inFlight      map[string]struct{} // per-agent probe 去重，mu 保护
+	probeSem      chan struct{}       // 并发探测闸，见 probeParallelLimit
 	probeInterval time.Duration
 	stopCh        chan struct{}
 	listeners     []func(Status)
@@ -122,6 +137,7 @@ func NewProber(cfg *Config, pool *Pool, probeInterval time.Duration) *Prober {
 		statuses:      make(map[string]Status),
 		metadata:      make(map[string]agentMetadataOverride),
 		inFlight:      make(map[string]struct{}),
+		probeSem:      make(chan struct{}, probeParallelLimit()),
 		probeInterval: probeInterval,
 		stopCh:        make(chan struct{}),
 	}
@@ -1247,6 +1263,16 @@ func (p *Prober) runDefinitionsConcurrently(defs []Definition, fn func(i int, de
 				delete(p.inFlight, def.Name)
 				p.mu.Unlock()
 			}()
+			// 排队拿闸位再动手：见 probeParallelLimit。等位期间保持 inFlight 占位，
+			// 周期探测不会把同一个 Agent 再排一遍。
+			if p.probeSem != nil {
+				select {
+				case p.probeSem <- struct{}{}:
+					defer func() { <-p.probeSem }()
+				case <-p.stopCh:
+					return
+				}
+			}
 			fn(i, def)
 		}(i, def)
 	}
