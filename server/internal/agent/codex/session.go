@@ -916,8 +916,17 @@ func codexProviderCredentials() (string, string) {
 	}
 	// Prefer credentials straight from the provider block in config.toml so a
 	// renamed provider (e.g. key "cpa" with name "CPA0") still resolves.
-	if base, key := codexProviderBlockCredentials(string(raw), provider); base != "" && key != "" {
-		return base, key
+	// A block that names its key via env_key (magpie's `env_key = "MAGPIE_API_KEY"`)
+	// has no inline token; codex itself resolves it from the environment or
+	// ~/.codex/.env, so we do the same — otherwise the model supplement silently
+	// falls back to api-providers.json (an IP base that may be unreachable).
+	if base, key, envKey := codexProviderBlockCredentials(string(raw), provider); base != "" {
+		if key == "" && envKey != "" {
+			key = codexEnvKeyValue(home, envKey)
+		}
+		if key != "" {
+			return base, key
+		}
 	}
 	cfgBase, err := os.UserConfigDir()
 	if err != nil {
@@ -949,22 +958,23 @@ func codexProviderCredentials() (string, string) {
 	return "", ""
 }
 
-// codexProviderBlockCredentials parses base_url + bearer token from the
-// [model_providers.<key>] block in ~/.codex/config.toml.
-func codexProviderBlockCredentials(configText, providerKey string) (string, string) {
+// codexProviderBlockCredentials parses base_url + bearer token (and the name of
+// an env-var-held key) from the [model_providers.<key>] block in
+// ~/.codex/config.toml.
+func codexProviderBlockCredentials(configText, providerKey string) (string, string, string) {
 	inBlock := false
-	base, key := "", ""
-	flush := func() (string, string) {
-		b, k := strings.TrimSpace(base), strings.TrimSpace(key)
-		base, key = "", ""
-		return b, k
+	base, key, envKey := "", "", ""
+	flush := func() (string, string, string) {
+		b, k, e := strings.TrimSpace(base), strings.TrimSpace(key), strings.TrimSpace(envKey)
+		base, key, envKey = "", "", ""
+		return b, k, e
 	}
 	for _, line := range strings.Split(configText, "\n") {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "[") {
 			if inBlock {
-				if b, k := flush(); b != "" && k != "" {
-					return b, k
+				if b, k, e := flush(); b != "" && (k != "" || e != "") {
+					return b, k, e
 				}
 			}
 			header := strings.ToLower(strings.TrimSpace(t))
@@ -988,12 +998,43 @@ func codexProviderBlockCredentials(configText, providerKey string) (string, stri
 			base = strings.Trim(strings.TrimSpace(v), `"'`)
 		case "experimental_bearer_token", "bearer_token", "api_key":
 			key = strings.Trim(strings.TrimSpace(v), `"'`)
+		case "env_key":
+			envKey = strings.Trim(strings.TrimSpace(v), `"'`)
 		}
 	}
 	if inBlock {
 		return flush()
 	}
-	return "", ""
+	return "", "", ""
+}
+
+// codexEnvKeyValue resolves an env-named provider key the way the codex CLI
+// does: process environment first, then ~/.codex/.env (which codex loads on
+// start). Returns "" when neither supplies a value.
+func codexEnvKeyValue(home, name string) string {
+	if name == "" {
+		return ""
+	}
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".codex", ".env"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		t = strings.TrimSpace(strings.TrimPrefix(t, "export "))
+		k, v, ok := strings.Cut(t, "=")
+		if !ok || strings.TrimSpace(k) != name {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(v), `"'`)
+	}
+	return ""
 }
 
 func fetchOpenAIModelIDs(ctx context.Context, baseURL, apiKey string) ([]string, error) {

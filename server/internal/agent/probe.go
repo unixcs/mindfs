@@ -906,7 +906,9 @@ func probeSessionTimeoutForPhase(phase probePhase) (time.Duration, bool) {
 	case probePhaseInitial:
 		return probeSessionTimeout, true
 	case probePhaseRecovery:
-		return 30 * time.Second, true
+		// 与 initial 同窗口：CLI 首次拉起要远程拉模型目录（magpie 一次 55 项），
+		// 30s 会在 session/new 未回时先超时，把健康 agent 误报成不可用。
+		return probeSessionTimeout, true
 	default:
 		return 0, false
 	}
